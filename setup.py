@@ -174,6 +174,7 @@ setup(name='mcr_dl',
       extras_require=extras_require,
       packages=find_packages(include=['mcr_dl', 'mcr_dl.*']),
       include_package_data=True,
+      package_data={"mcr_dl": ["build_config.yml"]},
       license='Apache Software License 2.0')
 
 end_time = time.time()

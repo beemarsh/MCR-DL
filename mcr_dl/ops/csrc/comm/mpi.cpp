@@ -20,6 +20,9 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <mpi.h>
+#if defined(OPEN_MPI) && OPEN_MPI
+#include <mpi-ext.h>
+#endif
 #include <nccl.h>
 #include <pybind11/embed.h>
 #include <torch/extension.h>
@@ -116,6 +119,19 @@ MPI_Datatype get_mpi_datatype(c10::ScalarType type)
         case c10::ScalarType::Float: mpi_type = MPI_FLOAT; break;
 
         case c10::ScalarType::Double: mpi_type = MPI_DOUBLE; break;
+
+        case c10::ScalarType::BFloat16:
+            // Match OSU-Nowlab/PyTorch's native MPI BF16 datatype selection.
+#if defined(MPIX_C_BF16)
+            mpi_type = MPIX_C_BF16;
+#elif defined(MPIX_BFLOAT16)
+            mpi_type = MPIX_BFLOAT16;
+#else
+            TORCH_CHECK(false,
+                        "MCR-DL MPI bfloat16 support requires MPIX_C_BF16 or "
+                        "MPIX_BFLOAT16. Rebuild MCR-DL with a BF16-capable MPI library.");
+#endif
+            break;
 
         default: mpi_type = MPI_BYTE;
     }

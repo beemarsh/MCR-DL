@@ -37,6 +37,37 @@ def env2int(env_list, default=-1):
     return default
 
 
+def init_benchmark(args):
+    """Select the CUDA device before MPI discovery or backend initialization."""
+    local_rank = args.local_rank
+    if local_rank is None:
+        local_rank = env2int([
+            'LOCAL_RANK', 'SLURM_LOCALID', 'OMPI_COMM_WORLD_LOCAL_RANK',
+            'MV2_COMM_WORLD_LOCAL_RANK', 'MPI_LOCALRANKID',
+            'MVP_COMM_WORLD_LOCAL_RANK',
+        ], default=0)
+
+    accelerator = get_accelerator()
+    device_count = accelerator.device_count()
+    if device_count == 0:
+        raise RuntimeError('Communication benchmarks require a visible CUDA device')
+
+    # A launcher may expose just one GPU, renumbered to cuda:0, to each rank.
+    device_index = 0 if device_count == 1 else local_rank
+    if local_rank < 0 or device_index >= device_count:
+        raise ValueError(
+            f'Local rank {local_rank} cannot select a CUDA device: '
+            f'{device_count} device(s) visible. Check the launcher GPU allocation.'
+        )
+
+    accelerator.set_device(device_index)
+    # Tensor placement and CUDA events must use the same device. Keep the
+    # launcher's LOCAL_RANK and CUDA_VISIBLE_DEVICES environment unchanged.
+    args.local_rank = device_index
+    mcr_dl.init_processes(args.dist, args.backend)
+    return device_index
+
+
 def print_rank_0(message):
     dist = mcr_dl.get_distributed_engine()
     if dist.get_rank() == 0:
@@ -165,7 +196,9 @@ def _element_size(dtype):
 
 def benchmark_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_rank", type=int)
+    parser.add_argument("--local_rank", "--local-rank", type=int,
+                        help='Local process rank (defaults to the launcher environment); '
+                             'uses cuda:0 when only one GPU is visible')
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help='Number of timed iterations')
     parser.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS, help='Number of warmup (non-timed) iterations')
     parser.add_argument("--maxsize", type=int, default=24, help='Max message size as a power of 2')

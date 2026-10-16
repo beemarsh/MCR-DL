@@ -33,7 +33,9 @@ from constants import *
 # For importing
 def main(args, rank):
 
-    mcr_dl.init_processes(args.dist, args.backend)
+    if rank is not None:
+        args.local_rank = rank
+    rank = init_benchmark(args)
 
     ops_to_run = []
     if args.all_reduce:

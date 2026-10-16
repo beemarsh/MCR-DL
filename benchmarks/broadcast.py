@@ -118,6 +118,5 @@ def run_broadcast(local_rank, args):
 
 if __name__ == "__main__":
     args = benchmark_parser().parse_args()
-    rank = args.local_rank
-    mcr_dl.init_processes(args.dist, args.backend)
+    rank = init_benchmark(args)
     run_broadcast(local_rank=rank, args=args)
