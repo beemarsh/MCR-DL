@@ -1,0 +1,13 @@
+# Replace the paths below with the correct paths for your system and rename this file to build.config.yml.
+# The paths should point to the installation directories of MPI, CUDA, and NCCL libraries.
+mpi:
+  path: "/.../builds/opt/mvapich/plus/5.1.0b/cuda12.9/ofi/slurm/gcc13.2.0"
+  include: "/.../mvapich/plus/5.1.0b/cuda12.9/ofi/slurm/gcc13.2.0/include"
+
+cuda:
+  path: ".../cuda/12.9"
+  include: ".../cuda/12.9/include"
+
+nccl:
+  path: ".../nccl/2.24.3"
+  include: ".../nccl/2.24.3/include"

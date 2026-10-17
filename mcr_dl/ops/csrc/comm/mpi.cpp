@@ -312,7 +312,7 @@ private:
         TORCH_CHECK(tensor.is_cpu() || tensor.is_cuda(),
                     "MCR-DL MPI supports CPU and CUDA tensors");
         if (tensor.is_cuda()) {
-            guard.set_device(tensor.device());
+            guard.reset_device(tensor.device());
             cudaStreamCaptureStatus status;
             CUDACHECK(cudaStreamIsCapturing(
                 c10::cuda::getCurrentCUDAStream(tensor.get_device()).stream(), &status));
