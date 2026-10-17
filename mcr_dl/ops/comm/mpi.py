@@ -29,9 +29,7 @@ def build_mpi_op():
         print(f'MCR-DL {builder.absolute_name()} built successfully')
         return mpi_cpp_module
     except Exception as inst:
-       # if comm cannot be built, use torch.dist.
-       print(f"Failed to build {builder.absolute_name()}. Full error: {inst}")
-       exit(0)
+        raise RuntimeError(f"Failed to build {builder.absolute_name()}") from inst
 
 
 def initialize():

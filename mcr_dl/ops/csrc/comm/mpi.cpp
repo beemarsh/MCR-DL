@@ -30,8 +30,14 @@
 namespace py = pybind11;
 
 #include <c10/util/irange.h>
+#include <c10/core/DeviceGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
+#include <algorithm>
 #include <iostream>
+#include <limits>
+#include <mutex>
+#include <numeric>
 #include <string>
 
 #include <comm.h>
@@ -65,6 +71,8 @@ ncclComm_t ncclcomm;
 // py::module_ dist = py::module_::import("mcr_dl");
 
 std::vector<MPI_Comm> global_mpi_comms;
+std::mutex mpi_mutex;
+bool owns_mpi = false;
 
 void create_comms(int number = 1)
 {
@@ -100,18 +108,46 @@ void print_counter() { std::cout << "Counter is:" << counter << "\n"; }
 
 void initialize()
 {
+    std::lock_guard<std::mutex> lock(mpi_mutex);
+    int finalized;
+    MPICHECK(MPI_Finalized(&finalized));
+    TORCH_CHECK(!finalized, "MCR-DL cannot reinitialize MPI after finalization");
     int flag;
     MPICHECK(MPI_Initialized(&flag));
-    if (!flag) MPICHECK(MPI_Init(NULL, NULL));
-    create_comms();
+    int provided;
+    if (!flag) {
+        MPICHECK(MPI_Init_thread(NULL, NULL, MPI_THREAD_SERIALIZED, &provided));
+        owns_mpi = true;
+    } else {
+        MPICHECK(MPI_Query_thread(&provided));
+    }
+    TORCH_CHECK(provided >= MPI_THREAD_SERIALIZED,
+                "MCR-DL requires MPI_THREAD_SERIALIZED or MPI_THREAD_MULTIPLE");
+    if (global_mpi_comms.empty()) create_comms();
 }
 
-void finalize() { MPICHECK(MPI_Finalize()); }
+void finalize()
+{
+    std::lock_guard<std::mutex> lock(mpi_mutex);
+    int finalized;
+    MPICHECK(MPI_Finalized(&finalized));
+    if (owns_mpi && !finalized) MPICHECK(MPI_Finalize());
+}
+
+void abort_world(int code) { MPI_Abort(MPI_COMM_WORLD, code); }
 
 MPI_Datatype get_mpi_datatype(c10::ScalarType type)
 {
     MPI_Datatype mpi_type;
     switch (type) {
+        case c10::ScalarType::Byte: mpi_type = MPI_UNSIGNED_CHAR; break;
+
+        case c10::ScalarType::Char: mpi_type = MPI_SIGNED_CHAR; break;
+
+        case c10::ScalarType::Short: mpi_type = MPI_SHORT; break;
+
+        case c10::ScalarType::Bool: mpi_type = MPI_C_BOOL; break;
+
         case c10::ScalarType::Int: mpi_type = MPI_INT; break;
 
         case c10::ScalarType::Long: mpi_type = MPI_LONG; break;
@@ -133,11 +169,165 @@ MPI_Datatype get_mpi_datatype(c10::ScalarType type)
 #endif
             break;
 
-        default: mpi_type = MPI_BYTE;
+        case c10::ScalarType::Half:
+#if defined(MPIX_C_FLOAT16)
+            mpi_type = MPIX_C_FLOAT16;
+#else
+            TORCH_CHECK(false, "MCR-DL MPI float16 support requires MPIX_C_FLOAT16");
+#endif
+            break;
+
+        default: TORCH_CHECK(false, "Unsupported MCR-DL MPI tensor dtype: ", type);
     }
 
     return mpi_type;
 }
+
+// Blocking, group-aware API used by inference runtimes. Unlike the legacy
+// wrappers, communicator membership and reduction operations are separate.
+class NativeGroup {
+public:
+    explicit NativeGroup(std::vector<int> ranks)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        int world_size, world_rank;
+        MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
+        MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank));
+        if (ranks.empty()) {
+            ranks.resize(world_size);
+            std::iota(ranks.begin(), ranks.end(), 0);
+        }
+        TORCH_CHECK(std::find(ranks.begin(), ranks.end(), world_rank) != ranks.end(),
+                    "Only members may construct an MCR-DL NativeGroup");
+        MPI_Group world_group, subgroup;
+        MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &world_group));
+        MPICHECK(MPI_Group_incl(world_group, ranks.size(), ranks.data(), &subgroup));
+        // This is collective only over members, matching torch.new_group's
+        // custom-backend contract. Groups must be constructed in the same order.
+        MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, subgroup, 0, &comm_));
+        MPICHECK(MPI_Group_free(&subgroup));
+        MPICHECK(MPI_Group_free(&world_group));
+        MPICHECK(MPI_Comm_rank(comm_, &rank_));
+        MPICHECK(MPI_Comm_size(comm_, &size_));
+    }
+
+    // MPI_Finalize owns communicator cleanup. Python object destruction is not
+    // ordered across ranks, so it must not perform collective MPI_Comm_free.
+    int rank() const { return rank_; }
+    int size() const { return size_; }
+
+    void all_reduce(torch::Tensor tensor, int op)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        c10::OptionalDeviceGuard guard;
+        prepare(tensor, guard);
+        MPI_Op reduction;
+        switch (op) {
+            case 0: reduction = MPI_SUM; break;
+            case 1: reduction = MPI_PROD; break;
+            case 2: reduction = MPI_MIN; break;
+            case 3: reduction = MPI_MAX; break;
+            default: TORCH_CHECK(false, "Unsupported MCR-DL reduction operation");
+        }
+        MPICHECK(MPI_Allreduce(MPI_IN_PLACE, tensor.data_ptr(), count(tensor),
+                               get_mpi_datatype(tensor.scalar_type()), reduction, comm_));
+        finish(tensor);
+    }
+
+    void all_gather(torch::Tensor output, torch::Tensor input)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        TORCH_CHECK(output.scalar_type() == input.scalar_type() &&
+                    output.device() == input.device() && output.is_contiguous() &&
+                    output.numel() == input.numel() * size_,
+                    "Invalid MCR-DL all_gather output");
+        c10::OptionalDeviceGuard guard;
+        prepare(input, guard);
+        MPICHECK(MPI_Allgather(input.data_ptr(), count(input),
+                               get_mpi_datatype(input.scalar_type()), output.data_ptr(),
+                               count(input), get_mpi_datatype(input.scalar_type()), comm_));
+        finish(output);
+    }
+
+    void broadcast(torch::Tensor tensor, int root)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        check_rank(root);
+        c10::OptionalDeviceGuard guard;
+        prepare(tensor, guard);
+        MPICHECK(MPI_Bcast(tensor.data_ptr(), count(tensor),
+                           get_mpi_datatype(tensor.scalar_type()), root, comm_));
+        finish(tensor);
+    }
+
+    void send(torch::Tensor tensor, int destination, int tag)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        check_rank(destination);
+        c10::OptionalDeviceGuard guard;
+        prepare(tensor, guard);
+        MPICHECK(MPI_Send(tensor.data_ptr(), count(tensor),
+                          get_mpi_datatype(tensor.scalar_type()), destination, tag, comm_));
+        finish(tensor);
+    }
+
+    void recv(torch::Tensor tensor, int source, int tag)
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        check_rank(source);
+        c10::OptionalDeviceGuard guard;
+        prepare(tensor, guard);
+        MPICHECK(MPI_Recv(tensor.data_ptr(), count(tensor),
+                          get_mpi_datatype(tensor.scalar_type()), source, tag, comm_,
+                          MPI_STATUS_IGNORE));
+        finish(tensor);
+    }
+
+    void barrier()
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        MPICHECK(MPI_Barrier(comm_));
+    }
+
+private:
+    MPI_Comm comm_;
+    int rank_, size_;
+
+    void check_rank(int rank) const
+    {
+        TORCH_CHECK(rank >= 0 && rank < size_, "MCR-DL group rank out of range");
+    }
+
+    static int count(const torch::Tensor& tensor)
+    {
+        TORCH_CHECK(tensor.numel() <= std::numeric_limits<int>::max(),
+                    "MCR-DL MPI tensor exceeds the MPI count limit");
+        return static_cast<int>(tensor.numel());
+    }
+
+    static void prepare(const torch::Tensor& tensor, c10::OptionalDeviceGuard& guard)
+    {
+        TORCH_CHECK(tensor.is_contiguous() && !tensor.is_sparse(),
+                    "MCR-DL MPI requires a dense contiguous tensor");
+        TORCH_CHECK(tensor.is_cpu() || tensor.is_cuda(),
+                    "MCR-DL MPI supports CPU and CUDA tensors");
+        if (tensor.is_cuda()) {
+            guard.set_device(tensor.device());
+            cudaStreamCaptureStatus status;
+            CUDACHECK(cudaStreamIsCapturing(
+                c10::cuda::getCurrentCUDAStream(tensor.get_device()).stream(), &status));
+            TORCH_CHECK(status == cudaStreamCaptureStatusNone,
+                        "MCR-DL MPI collectives cannot execute inside CUDA graph capture");
+            // Correctness first: complete producer work before host-side MPI.
+            CUDACHECK(cudaDeviceSynchronize());
+        }
+    }
+
+    static void finish(const torch::Tensor& tensor)
+    {
+        if (tensor.is_cuda()) CUDACHECK(cudaDeviceSynchronize());
+    }
+};
 
 void send(torch::Tensor data, int rank, int tag)
 {
@@ -347,6 +537,17 @@ torch::Tensor wait_multi(size_t casted_req, torch::Tensor data)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    py::class_<NativeGroup>(m, "NativeGroup")
+        .def(py::init<std::vector<int>>(), py::call_guard<py::gil_scoped_release>())
+        .def("rank", &NativeGroup::rank)
+        .def("size", &NativeGroup::size)
+        .def("all_reduce", &NativeGroup::all_reduce, py::call_guard<py::gil_scoped_release>())
+        .def("all_gather", &NativeGroup::all_gather, py::call_guard<py::gil_scoped_release>())
+        .def("broadcast", &NativeGroup::broadcast, py::call_guard<py::gil_scoped_release>())
+        .def("send", &NativeGroup::send, py::call_guard<py::gil_scoped_release>())
+        .def("recv", &NativeGroup::recv, py::call_guard<py::gil_scoped_release>())
+        .def("barrier", &NativeGroup::barrier, py::call_guard<py::gil_scoped_release>());
+    m.def("abort", &abort_world, py::call_guard<py::gil_scoped_release>());
     m.def("send", &send, "mpi send");
     m.def("recv", &recv, "mpi recv");
     m.def("isend", &isend, "mpi isend");
@@ -363,8 +564,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("wait", &wait, "mpi wait");
     m.def("device_sync", &device_sync, "mpi device sync");
     m.def("wait_multi", &wait_multi, "mpi wait multi");
-    m.def("initialize", &initialize, "mpi initialize");
-    m.def("finalize", &finalize, "mpi finalize");
+    m.def("initialize", &initialize, "mpi initialize", py::call_guard<py::gil_scoped_release>());
+    m.def("finalize", &finalize, "mpi finalize", py::call_guard<py::gil_scoped_release>());
     m.def("get_rank", &get_rank, "get rank");
     m.def("barrier", &barrier, "barrier");
     m.def("get_world_size", &get_world_size, "get world size");

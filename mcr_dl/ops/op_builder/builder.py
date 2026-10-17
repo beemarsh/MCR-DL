@@ -519,6 +519,9 @@ class OpBuilder(ABC):
                          extra_cflags=cxx_args,
                          extra_cuda_cflags=nvcc_args,
                          extra_ldflags=self.strip_empty_entries(self.extra_ldflags()),
+                         # MPI has only .cpp sources but uses PyTorch's CUDA
+                         # stream API, so source suffix detection is insufficient.
+                         with_cuda=isinstance(self, CUDAOpBuilder) and not self.build_for_cpu,
                          verbose=verbose)
         build_duration = time.time() - start_build
         if verbose:
