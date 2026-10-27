@@ -24,6 +24,7 @@
 #include <nccl.h>
 #include <pybind11/embed.h>
 #include <torch/extension.h>
+#include <torch/version.h>
 #include <chrono>
 namespace py = pybind11;
 
@@ -186,16 +187,56 @@ cudaStream_t GetCommStream(bool async_op = false)
 
 void finalize() { NCCLCHECK(ncclCommDestroy(_world_nccl_comm)); }
 
-ncclDataType_t get_nccl_datatype(c10::ScalarType type)
+ncclDataType_t get_nccl_datatype(const torch::Tensor& tensor)
 {
-    ncclDataType_t nccl_type;
+    const auto type = tensor.scalar_type();
     switch (type) {
-        case c10::ScalarType::Int: nccl_type = ncclInt; break;
-        case c10::ScalarType::Float: nccl_type = ncclFloat; break;
-        case c10::ScalarType::Double: nccl_type = ncclDouble; break;
-        default: nccl_type = ncclChar;
+        case c10::ScalarType::Char: return ncclInt8;
+        case c10::ScalarType::Byte: return ncclUint8;
+        case c10::ScalarType::Int: return ncclInt32;
+        case c10::ScalarType::Long: return ncclInt64;
+        case c10::ScalarType::Half: return ncclFloat16;
+        case c10::ScalarType::Float: return ncclFloat32;
+        case c10::ScalarType::Double: return ncclFloat64;
+
+        // PyTorch added these unsigned scalar types in 2.3.
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 3)
+        case c10::ScalarType::UInt32: return ncclUint32;
+        case c10::ScalarType::UInt64: return ncclUint64;
+#endif
+
+        case c10::ScalarType::BFloat16:
+            // Older NCCL headers expose BF16 only when CUDA provides its types.
+#if NCCL_VERSION_CODE >= 21000 && defined(__CUDA_BF16_TYPES_EXIST__)
+            return ncclBfloat16;
+#else
+            TORCH_CHECK(false,
+                        "MCR-DL NCCL bfloat16 support requires NCCL 2.10 or later "
+                        "and CUDA 11 or later. Rebuild with compatible headers and libraries.");
+#endif
+
+        // These exact FP8 formats first appeared in PyTorch 2.1 and NCCL 2.24.
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 1)
+        case c10::ScalarType::Float8_e4m3fn:
+        case c10::ScalarType::Float8_e5m2:
+#if NCCL_VERSION_CODE >= 22400 && CUDART_VERSION >= 11080
+            TORCH_CHECK(tensor.is_cuda(), "MCR-DL NCCL FP8 tensors must be on CUDA");
+            TORCH_CHECK(at::cuda::getDeviceProperties(tensor.get_device())->major >= 9,
+                        "MCR-DL NCCL FP8 support requires a GPU with compute capability 9.0 or later");
+            return type == c10::ScalarType::Float8_e4m3fn ? ncclFloat8e4m3 : ncclFloat8e5m2;
+#else
+            TORCH_CHECK(false,
+                        "MCR-DL NCCL FP8 support requires NCCL 2.24 or later "
+                        "and CUDA 11.8 or later. Rebuild with compatible headers and libraries.");
+#endif
+#endif
+
+        default:
+            TORCH_CHECK(false,
+                        "Unsupported MCR-DL NCCL tensor dtype: ", type,
+                        ". No exact native NCCL mapping is enabled for this dtype; "
+                        "implicit byte reinterpretation is not supported.");
     }
-    return nccl_type;
 }
 
 ncclRedOp_t get_nccl_reduce_op(py::object op, at::Tensor& input)
@@ -208,16 +249,9 @@ ncclRedOp_t get_nccl_reduce_op(py::object op, at::Tensor& input)
     int op_val = py::int_(op.attr("value"));
     ncclRedOp_t nccl_op;
 
-    if (input.scalar_type() == at::kBool) {
-        if (op_val == (int)py::int_(ReduceOp.attr("SUM").attr("value"))) {
-            // For bool tensors, map sum to max, which both represent a bitwise or.
-            // This is to prevent overflow issues with sum, since we use uint8 to
-            // represent a bool (see ncclDataType mapping).
-            nccl_op = ncclMax;
-        } else if (op_val == (int)py::int_(ReduceOp.attr("AVG").attr("value"))) {
-            throw std::runtime_error("Error: For bool tensors, op must be of type ReduceOp");
-        }
-    }
+    TORCH_CHECK(input.scalar_type() != at::kBool,
+                "MCR-DL NCCL does not support bool reductions; "
+                "an explicit boolean reduction policy is required");
 
     if (op_val == (int)py::int_(ReduceOp.attr("SUM").attr("value"))) {
         nccl_op = ncclSum;
@@ -240,7 +274,7 @@ void send(torch::Tensor data, int rank, int tag, bool block, py::object group, b
     ncclComm_t comm = _get_comm_from_group(group);
     NCCLCHECK(ncclSend(data.data_ptr(),
                        data.numel(),
-                       get_nccl_datatype(data.scalar_type()),
+                       get_nccl_datatype(data),
                        rank,
                        comm,
                        GetCommStream(async_op)));
@@ -253,7 +287,7 @@ void recv(torch::Tensor data, int rank, int tag, bool block, py::object group, b
     ncclComm_t comm = _get_comm_from_group(group);
     NCCLCHECK(ncclRecv(data.data_ptr(),
                        data.numel(),
-                       get_nccl_datatype(data.scalar_type()),
+                       get_nccl_datatype(data),
                        rank,
                        comm,
                        GetCommStream(async_op)));
@@ -267,7 +301,7 @@ void all_reduce(torch::Tensor& data, py::object op, bool block, py::object group
     NCCLCHECK(ncclAllReduce(data.data_ptr(),
                             data.data_ptr(),
                             data.numel(),
-                            get_nccl_datatype(data.scalar_type()),
+                            get_nccl_datatype(data),
                             get_nccl_reduce_op(op, data),
                             comm,
                             GetCommStream(async_op)));
@@ -398,6 +432,8 @@ void all_gather_base(torch::Tensor& output,
                      py::object group,
                      bool async_op)
 {
+    TORCH_CHECK(output.scalar_type() == input.scalar_type(),
+                "MCR-DL NCCL all_gather requires matching input/output dtypes");
     // void* sendbuff = data.data_ptr();
     // torch::Tensor recvbuf = torch::empty_like(data);
     ncclComm_t comm = _get_comm_from_group(group);
@@ -405,7 +441,7 @@ void all_gather_base(torch::Tensor& output,
     NCCLCHECK(ncclAllGather(input.data_ptr(),
                             output.data_ptr(),
                             input.numel(),
-                            get_nccl_datatype(input.scalar_type()),
+                            get_nccl_datatype(input),
                             _world_nccl_comm,
                             GetCommStream(async_op)));
     if (block) { CUDACHECK(cudaStreamSynchronize(GetCommStream(async_op))); }
@@ -465,6 +501,8 @@ std::vector<at::Tensor> flatten_for_scatter_gather(
         }
 
         for (const auto& t : tensor_lists[i]) {
+            TORCH_CHECK(t.scalar_type() == other[i].scalar_type(),
+                        "MCR-DL NCCL all_gather requires matching input/output dtypes");
             if (t.numel() != other[i].numel()) {
                 throw std::runtime_error(
                     "All tensor operands to scatter/gather must have the same number of elements");
@@ -486,13 +524,17 @@ void all_gather(std::vector<std::vector<torch::Tensor>>& outputTensors,
         flatten_for_scatter_gather(outputTensors, inputTensors, get_world_size(0));
     ncclComm_t comm = _get_comm_from_group(group);
 
+    // Validate before opening a group: a dtype exception must not leave it open.
+    std::vector<ncclDataType_t> types;
+    types.reserve(inputTensors.size());
+    for (const auto& input : inputTensors) { types.push_back(get_nccl_datatype(input)); }
     NCCLCHECK(ncclGroupStart());
 
     for (size_t i = 0; i < inputTensors.size(); ++i) {
         NCCLCHECK(ncclAllGather(inputTensors[i].data_ptr(),
                                 outputFlattened[i].data_ptr(),
                                 inputTensors[i].numel(),
-                                get_nccl_datatype(inputTensors[i].scalar_type()),
+                                types[i],
                                 comm,
                                 GetCommStream(async_op)));
     }
@@ -523,7 +565,7 @@ void reduce(torch::Tensor& data,
     NCCLCHECK(ncclReduce(data.data_ptr(),
                          data.data_ptr(),
                          data.numel(),
-                         get_nccl_datatype(data.scalar_type()),
+                         get_nccl_datatype(data),
                          get_nccl_reduce_op(op, data),
                          root,
                          comm,
@@ -540,7 +582,7 @@ void reduce_scatter(torch::Tensor& data, py::object op, bool block, py::object g
     NCCLCHECK(ncclReduceScatter(data.data_ptr(),
                                 data.data_ptr(),
                                 data.numel(),
-                                get_nccl_datatype(data.scalar_type()),
+                                get_nccl_datatype(data),
                                 get_nccl_reduce_op(op, data),
                                 comm,
                                 GetCommStream(async_op)));
@@ -554,7 +596,7 @@ void broadcast(torch::Tensor& data, int src, bool block, py::object group, bool 
     NCCLCHECK(ncclBroadcast(data.data_ptr(),
                             data.data_ptr(),
                             data.numel(),
-                            get_nccl_datatype(data.scalar_type()),
+                            get_nccl_datatype(data),
                             src,
                             comm,
                             GetCommStream(async_op)));
@@ -568,6 +610,9 @@ void all_to_all_single(torch::Tensor outputTensor,
                        py::object group,
                        bool async_op)
 {
+    TORCH_CHECK(outputTensor.scalar_type() == inputTensor.scalar_type(),
+                "MCR-DL NCCL all_to_all_single requires matching input/output dtypes");
+    ncclDataType_t type = get_nccl_datatype(inputTensor);
     // std::chrono::steady_clock::time_point begin, end;
     const auto* sendbuff = reinterpret_cast<char*>(inputTensor.data_ptr());
     auto* recvbuff = reinterpret_cast<char*>(outputTensor.data_ptr());
@@ -578,7 +623,6 @@ void all_to_all_single(torch::Tensor outputTensor,
     // if (is_prof) { begin = std::chrono::steady_clock::now(); }
     NCCLCHECK(ncclGroupStart());
     int count = inputTensor.numel() / nRanks;
-    ncclDataType_t type = get_nccl_datatype(inputTensor.scalar_type());
     for (int r = 0; r < nRanks; r++) {
         if (count != 0) {
             NCCLCHECK(
@@ -599,6 +643,15 @@ void all_to_all(std::vector<torch::Tensor>& inputTensors,
                 py::object group,
                 bool async_op)
 {
+    TORCH_CHECK(inputTensors.size() == outputTensors.size(),
+                "MCR-DL NCCL all_to_all requires equally sized input/output tensor lists");
+    std::vector<ncclDataType_t> inputTypes, outputTypes;
+    inputTypes.reserve(inputTensors.size());
+    outputTypes.reserve(outputTensors.size());
+    for (size_t t = 0; t < inputTensors.size(); ++t) {
+        inputTypes.push_back(get_nccl_datatype(inputTensors[t]));
+        outputTypes.push_back(get_nccl_datatype(outputTensors[t]));
+    }
     ncclComm_t comm = _get_comm_from_group(group);
     NCCLCHECK(ncclGroupStart());
     for (int t = 0; t < inputTensors.size(); t++) {
@@ -607,7 +660,7 @@ void all_to_all(std::vector<torch::Tensor>& inputTensors,
         if (input.numel() != 0) {
             NCCLCHECK(ncclSend(input.data_ptr(),
                                input.numel(),
-                               get_nccl_datatype(input.scalar_type()),
+                               inputTypes[t],
                                t,
                                comm,
                                GetCommStream(async_op)));
@@ -615,7 +668,7 @@ void all_to_all(std::vector<torch::Tensor>& inputTensors,
         if (output.numel() != 0) {
             NCCLCHECK(ncclRecv(output.data_ptr(),
                                output.numel(),
-                               get_nccl_datatype(output.scalar_type()),
+                               outputTypes[t],
                                t,
                                comm,
                                GetCommStream(async_op)));
