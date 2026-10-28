@@ -17,38 +17,33 @@
 * limitations under the License.
 */
 
-#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <mpi.h>
 #if defined(OPEN_MPI) && OPEN_MPI
 #include <mpi-ext.h>
 #endif
-#include <nccl.h>
-#include <pybind11/embed.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <chrono>
 namespace py = pybind11;
 
-#include <c10/util/irange.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
-#include <comm.h>
-
-// TODO: remove
 #include <stdio.h>
 
 #define MPICHECK(cmd)                                                        \
@@ -76,28 +71,15 @@ namespace py = pybind11;
 namespace mpi
 {
 
-    int counter = 0;
-    ncclComm_t ncclcomm;
-
-    // py::module_ dist = py::module_::import("mcr_dl");
-
-    std::vector<MPI_Comm> global_mpi_comms;
+    // MPI_THREAD_SERIALIZED allows calls from different threads, one at a time.
     std::mutex mpi_mutex;
     bool owns_mpi = false;
 
-    void create_comms(int number = 1)
-    {
-        int size = global_mpi_comms.size();
-        global_mpi_comms.resize(size + number);
-
-        for (int i = 0; i < number; ++i)
-        {
-            MPICHECK(MPI_Comm_dup(MPI_COMM_WORLD, &global_mpi_comms[size + i]));
-        }
-    }
-
+    // These world helpers are also used to bootstrap the NCCL backend.
     int get_rank(int group = 0)
     {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        TORCH_CHECK(group == 0, "Use NativeGroup.rank() for subgroup queries");
         int world_rank;
         MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank));
         return world_rank;
@@ -105,18 +87,18 @@ namespace mpi
 
     int get_world_size(int group = 0)
     {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        TORCH_CHECK(group == 0, "Use NativeGroup.size() for subgroup queries");
         int world_size;
         MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
         return world_size;
     }
 
-    void print_comm_number() { std::cout << "Number of Comms:" << global_mpi_comms.size() << "\n"; }
-
-    void increase_counter() { counter++; }
-
-    void decrease_counter() { counter--; }
-
-    void print_counter() { std::cout << "Counter is:" << counter << "\n"; }
+    void barrier()
+    {
+        std::lock_guard<std::mutex> lock(mpi_mutex);
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
 
     void initialize()
     {
@@ -138,8 +120,6 @@ namespace mpi
         }
         TORCH_CHECK(provided >= MPI_THREAD_SERIALIZED,
                     "MCR-DL requires MPI_THREAD_SERIALIZED or MPI_THREAD_MULTIPLE");
-        if (global_mpi_comms.empty())
-            create_comms();
     }
 
     void finalize()
@@ -191,7 +171,7 @@ namespace mpi
             break;
 
         case c10::ScalarType::BFloat16:
-            // Match OSU-Nowlab/PyTorch's native MPI BF16 datatype selection.
+            // Match native MPI BF16 datatype selection.
 #if defined(MPIX_C_BF16)
             mpi_type = MPIX_C_BF16;
 #elif defined(MPIX_BFLOAT16)
@@ -218,8 +198,8 @@ namespace mpi
         return mpi_type;
     }
 
-    // Keeps the buffer alive until MPI completes. Callers must not access an
-    // active receive buffer or modify an active send buffer before completion.
+    // Represents a native MPI request, ensuring the associated tensor remains alive until the request completes.
+    // Currently this is only for non-blocking send and recv.
     class NativeRequest
     {
     public:
@@ -304,10 +284,10 @@ namespace mpi
         }
     };
 
-    // Group-aware API used by inference runtimes.
-    // Communicator membership and reduction operations are separate.
-    //MPI Group Wrapper
-    // Stores the MPI communicator and provides collective operations on it.
+    // NativeGroup represents a group of MPI ranks that can communicate with each other.
+    // One communicator for a set of existing MPI ranks. 
+    // All tensor communication goes through this class
+    // It however does not create processes or worker threads. See above for initialize function.
     class NativeGroup
     {
     public:
@@ -326,7 +306,8 @@ namespace mpi
                         "Only members may construct an MCR-DL NativeGroup");
             MPI_Group world_group, subgroup;
             MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &world_group));
-            MPICHECK(MPI_Group_incl(world_group, ranks.size(), ranks.data(), &subgroup));    
+            MPICHECK(MPI_Group_incl(world_group, ranks.size(), ranks.data(), &subgroup));
+            // Members must create overlapping groups in the same order.
             MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, subgroup, 0, &comm_));
             MPICHECK(MPI_Group_free(&subgroup));
             MPICHECK(MPI_Group_free(&world_group));
@@ -358,9 +339,9 @@ namespace mpi
         void all_gather(torch::Tensor output, torch::Tensor input)
         {
             std::lock_guard<std::mutex> lock(mpi_mutex);
-            TORCH_CHECK(output.scalar_type() == input.scalar_type() &&
-                            output.device() == input.device() && output.is_contiguous() &&
-                            output.numel() == input.numel() * size_,
+            check_buffers(output, input);
+            TORCH_CHECK(output.numel() % size_ == 0 &&
+                            output.numel() / size_ == input.numel(),
                         "Invalid MCR-DL all_gather output");
             c10::OptionalDeviceGuard guard;
             prepare(input, guard);
@@ -578,8 +559,8 @@ namespace mpi
         void print_elapsed(const char *operation, Clock::time_point begin,
                            const torch::Tensor &tensor) const
         {
-            // Match the legacy timing scope: MPI call only, excluding CUDA
-            // preparation/completion and validation. Only group rank zero prints.
+            // Measure only the MPI call; CUDA synchronization is outside this
+            // interval. Only group rank zero prints.
             const auto end = Clock::now();
             if (rank_ == 0)
                 std::cout << "MCR-DL NativeGroup " << operation << " MPI time = "
@@ -643,223 +624,6 @@ namespace mpi
         }
     };
 
-    void send(torch::Tensor data, int rank, int tag)
-    {
-        MPICHECK(MPI_Send(data.data_ptr(),
-                          data.numel(),
-                          get_mpi_datatype(data.scalar_type()),
-                          rank,
-                          tag,
-                          MPI_COMM_WORLD));
-    }
-
-    void barrier() { MPICHECK(MPI_Barrier(MPI_COMM_WORLD)); }
-
-    void recv(torch::Tensor data, int rank, int tag)
-    {
-        MPICHECK(MPI_Recv(data.data_ptr(),
-                          data.numel(),
-                          get_mpi_datatype(data.scalar_type()),
-                          rank,
-                          tag,
-                          MPI_COMM_WORLD,
-                          MPI_STATUS_IGNORE));
-    }
-
-    size_t isend(torch::Tensor data, int rank, int tag, int comm = 0)
-    {
-        MPI_Request req;
-        MPICHECK(MPI_Isend(data.data_ptr(),
-                           data.numel(),
-                           get_mpi_datatype(data.scalar_type()),
-                           rank,
-                           tag,
-                           global_mpi_comms[comm],
-                           &req));
-        size_t casted_req = size_t(req);
-        return casted_req;
-    }
-
-    size_t irecv(torch::Tensor data, int rank, int tag, int comm = 0)
-    {
-        MPI_Request req;
-        MPICHECK(MPI_Irecv(data.data_ptr(),
-                           data.numel(),
-                           get_mpi_datatype(data.scalar_type()),
-                           rank,
-                           tag,
-                           global_mpi_comms[comm],
-                           &req));
-        size_t casted_req = size_t(req);
-        return casted_req;
-    }
-
-    void allreduce(torch::Tensor data, py::object comm, bool is_prof)
-    {
-        std::chrono::steady_clock::time_point begin, end;
-        torch::Tensor recvbuf = torch::empty_like(data);
-        int comm_val = py::int_(comm.attr("value"));
-
-        if (is_prof)
-        {
-            begin = std::chrono::steady_clock::now();
-        }
-        MPICHECK(MPI_Allreduce(MPI_IN_PLACE,
-                               data.data_ptr(),
-                               data.numel(),
-                               get_mpi_datatype(data.scalar_type()),
-                               MPI_SUM,
-                               global_mpi_comms[comm_val]));
-        if (is_prof)
-        {
-            end = std::chrono::steady_clock::now();
-            if (get_rank() == 0)
-            {
-                std::cout << "MPI allreduce time = "
-                          << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()
-                          << "us, Size = " << data.numel() * data.element_size() << " B"
-                          << "\n";
-            }
-        }
-    }
-
-    void allgather(torch::Tensor outputTensor, torch::Tensor inputTensor, int comm = 0)
-    {
-        MPICHECK(MPI_Allgather(inputTensor.data_ptr(),
-                               inputTensor.numel() / get_world_size(0),
-                               get_mpi_datatype(inputTensor.scalar_type()),
-                               outputTensor.data_ptr(),
-                               outputTensor.numel() / get_world_size(0),
-                               get_mpi_datatype(outputTensor.scalar_type()),
-                               global_mpi_comms[comm]));
-    }
-
-    void gather(torch::Tensor data, int root_rank, int comm = 0)
-    {
-        torch::Tensor recvbuf = torch::empty_like(data);
-        MPICHECK(MPI_Gather(data.data_ptr(),
-                            data.numel(),
-                            get_mpi_datatype(data.scalar_type()),
-                            recvbuf.data_ptr(),
-                            data.numel(),
-                            get_mpi_datatype(data.scalar_type()),
-                            root_rank,
-                            global_mpi_comms[comm]));
-    }
-
-    void scatter(torch::Tensor data, int root_rank, int comm = 0)
-    {
-        torch::Tensor recvbuf = torch::empty_like(data);
-        MPICHECK(MPI_Scatter(data.data_ptr(),
-                             data.numel(),
-                             get_mpi_datatype(data.scalar_type()),
-                             recvbuf.data_ptr(),
-                             data.numel(),
-                             get_mpi_datatype(data.scalar_type()),
-                             root_rank,
-                             global_mpi_comms[comm]));
-    }
-    /*
-    void reduce_scatter(torch::Tensor data, int comm=0)
-    {
-      torch::Tensor recvbuf = torch::empty_like(data);
-      MPI_Reduce_scatter( data.data_ptr(),
-                recvbuf.data_ptr(),
-                data.numel(),
-                get_mpi_datatype(data.scalar_type()),
-                MPI_SUM,
-                global_mpi_comms[comm]);
-    }
-    */
-    void reduce(torch::Tensor data, int root_rank, int comm = 0)
-    {
-        torch::Tensor recvbuf = torch::empty_like(data);
-        MPICHECK(MPI_Reduce(data.data_ptr(),
-                            recvbuf.data_ptr(),
-                            data.numel(),
-                            get_mpi_datatype(data.scalar_type()),
-                            MPI_SUM,
-                            root_rank,
-                            global_mpi_comms[comm]));
-    }
-
-    void bcast(torch::Tensor data, int root_rank, py::object comm)
-    {
-        int comm_val = py::int_(comm.attr("value"));
-
-        MPICHECK(MPI_Bcast(data.data_ptr(),
-                           data.numel(),
-                           get_mpi_datatype(data.scalar_type()),
-                           root_rank,
-                           global_mpi_comms[comm_val]));
-    }
-
-    void alltoall(torch::Tensor outputTensor, torch::Tensor inputTensor, py::object comm, bool is_prof)
-    {
-        std::chrono::steady_clock::time_point begin, end;
-        int comm_val = py::int_(comm.attr("value"));
-
-        if (is_prof)
-        {
-            begin = std::chrono::steady_clock::now();
-        }
-        MPICHECK(MPI_Alltoall(inputTensor.data_ptr(),
-                              inputTensor.numel() / get_world_size(0),
-                              get_mpi_datatype(inputTensor.scalar_type()),
-                              outputTensor.data_ptr(),
-                              outputTensor.numel() / get_world_size(0),
-                              get_mpi_datatype(outputTensor.scalar_type()),
-                              global_mpi_comms[comm_val]));
-        if (is_prof)
-        {
-            end = std::chrono::steady_clock::now();
-            if (get_rank(0) == 0)
-            {
-                std::cout << "MPI alltoall time = "
-                          << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()
-                          << "us, Size = " << inputTensor.numel() * inputTensor.element_size() << " B"
-                          << "\n";
-            }
-        }
-    }
-
-    void alltoall_list(std::vector<torch::Tensor> &outputTensors,
-                       std::vector<torch::Tensor> &inputTensors,
-                       int comm = 0)
-    {
-        for (int t = 0; t < inputTensors.size(); t++)
-        {
-            torch::Tensor &input = inputTensors[t];
-            torch::Tensor &output = outputTensors[t];
-            MPICHECK(MPI_Alltoall(input.data_ptr(),
-                                  input.numel(),
-                                  get_mpi_datatype(input.scalar_type()),
-                                  output.data_ptr(),
-                                  output.numel(),
-                                  get_mpi_datatype(output.scalar_type()),
-                                  global_mpi_comms[comm]));
-        }
-    }
-
-    void wait(size_t casted_req)
-    {
-        MPI_Request req = (MPI_Request)casted_req;
-        MPI_Status status;
-
-        MPICHECK(MPI_Wait(&req, &status));
-    }
-
-    void device_sync() { CUDACHECK(cudaDeviceSynchronize()); }
-
-    torch::Tensor wait_multi(size_t casted_req, torch::Tensor data)
-    {
-        MPI_Request req = (MPI_Request)casted_req;
-        MPI_Status status;
-
-        MPICHECK(MPI_Wait(&req, &status));
-        return data;
-    }
-
     PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     {
         py::class_<NativeRequest, std::shared_ptr<NativeRequest>>(m, "NativeRequest",
@@ -917,32 +681,13 @@ namespace mpi
                  py::call_guard<py::gil_scoped_release>())
             .def("barrier", &NativeGroup::barrier, py::call_guard<py::gil_scoped_release>());
         m.def("abort", &abort_world, py::call_guard<py::gil_scoped_release>());
-        m.def("send", &send, "mpi send");
-        m.def("recv", &recv, "mpi recv");
-        m.def("isend", &isend, "mpi isend");
-        m.def("irecv", &irecv, "mpi irecv");
-        m.def("allreduce", &allreduce, "mpi allreduce");
-        m.def("allgather", &allgather, "mpi allgather");
-        m.def("gather", &gather, "mpi gather");
-        m.def("scatter", &scatter, "mpi scatter");
-        // m.def("reduce_scatter", &reduce_scatter, "mpi reduce-scatter");
-        m.def("reduce", &reduce, "mpi reduce");
-        m.def("bcast", &bcast, "mpi bcast");
-        m.def("alltoall", &alltoall, "mpi alltoall");
-        m.def("alltoall_list", &alltoall_list, "mpi alltoall list");
-        m.def("wait", &wait, "mpi wait");
-        m.def("device_sync", &device_sync, "mpi device sync");
-        m.def("wait_multi", &wait_multi, "mpi wait multi");
         m.def("initialize", &initialize, "mpi initialize", py::call_guard<py::gil_scoped_release>());
         m.def("finalize", &finalize, "mpi finalize", py::call_guard<py::gil_scoped_release>());
-        m.def("get_rank", &get_rank, "get rank");
-        m.def("barrier", &barrier, "barrier");
-        m.def("get_world_size", &get_world_size, "get world size");
-        m.def("increase_counter", &increase_counter, "mpi increase counter");
-        m.def("decrease_counter", &decrease_counter, "mpi decrease counter");
-        m.def("print_counter", &print_counter, "mpi print counter");
-        m.def("create_comms", &create_comms, "mpi create comms");
-        m.def("print_comm_number", &print_comm_number, "mpi print comm number");
+        m.def("get_rank", &get_rank, py::arg("group") = 0,
+              py::call_guard<py::gil_scoped_release>());
+        m.def("barrier", &barrier, py::call_guard<py::gil_scoped_release>());
+        m.def("get_world_size", &get_world_size, py::arg("group") = 0,
+              py::call_guard<py::gil_scoped_release>());
     }
 
 } // namespace mpi
