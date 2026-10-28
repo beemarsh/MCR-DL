@@ -115,6 +115,10 @@ def timed_op(func):
     def log_wrapper(*args, **kwargs):
         # Add enabled flag so that overhead to each comm op is two if conditions at most
         if comms_logger.enabled:
+            # A NativeRequest must reach the caller before any wait or barrier.
+            # This synchronous logger cannot measure its completion latency.
+            if isinstance(cdb, MPIBackend) and func.__name__ in ('isend', 'irecv'):
+                return func(*args, **kwargs)
             if ('prof' in kwargs
                     and kwargs['prof']) or comms_logger.prof_all or ('log_name' in kwargs
                                                                      and kwargs['log_name'] in comms_logger.prof_ops):
@@ -131,8 +135,9 @@ def timed_op(func):
             if comms_logger.enabled:
                 # Need to make op blocking for accurate logging
                 get_accelerator().synchronize()
-                # If we're using MPI, we can't simply sync the stream
-                if cdb.using_mpi:
+                # NativeGroup already completes blocking operations. A world
+                # barrier here would also hang calls involving only a subgroup.
+                if cdb.using_mpi and not isinstance(cdb, MPIBackend):
                     cdb.barrier()
                 if ('prof' in kwargs and kwargs['prof']) or comms_logger.prof_all or (
                         'log_name' in kwargs and kwargs['log_name'] in comms_logger.prof_ops):
@@ -374,13 +379,16 @@ def recv(tensor, src=None, group=None, tag=0, prof=False, log_name='recv', debug
 @timed_op
 def isend(tensor, dst, group=None, tag=0, prof=False, log_name='isend', debug=get_caller_func()):
     global cdb
-    return cdb.send(tensor=tensor, dst=dst, group=group, tag=tag)
+    # Use request-returning operations when the backend provides them.
+    send_op = getattr(cdb, 'isend', cdb.send)
+    return send_op(tensor=tensor, dst=dst, group=group, tag=tag)
 
 
 @timed_op
 def irecv(tensor, src=None, group=None, tag=0, prof=False, log_name='irecv', debug=get_caller_func()):
     global cdb
-    return cdb.recv(tensor=tensor, src=src, group=group, tag=tag)
+    recv_op = getattr(cdb, 'irecv', cdb.recv)
+    return recv_op(tensor=tensor, src=src, group=group, tag=tag)
 
 
 @timed_op
