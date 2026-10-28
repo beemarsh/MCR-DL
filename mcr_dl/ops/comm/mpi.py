@@ -16,121 +16,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Load MPI and share one default NativeGroup between Python backend instances."""
+
 from mcr_dl.ops import op_builder
 
+__all__ = ['build_mpi_op', 'initialize', 'finalize']
+
 mpi_cpp_module = None
+_world_group = None
 
 
 def build_mpi_op():
     global mpi_cpp_module
-    builder = op_builder.MPICommBuilder()
-    try:
-        mpi_cpp_module = builder.load()
-        print(f'MCR-DL {builder.absolute_name()} built successfully')
-        return mpi_cpp_module
-    except Exception as inst:
-        raise RuntimeError(f"Failed to build {builder.absolute_name()}") from inst
+    if mpi_cpp_module is None:
+        builder = op_builder.MPICommBuilder()
+        try:
+            mpi_cpp_module = builder.load()
+        except Exception as inst:
+            raise RuntimeError(f"Failed to build {builder.absolute_name()}") from inst
+    return mpi_cpp_module
 
 
 def initialize():
-    mpi_cpp_module.initialize()
+    """Call collectively from one thread per rank; return the default group."""
+    global _world_group
+    module = build_mpi_op()
+    module.initialize()
+    if _world_group is None:
+        # An empty rank list selects every rank in MPI_COMM_WORLD.
+        _world_group = module.NativeGroup([])
+    return _world_group
 
 
 def finalize():
-    mpi_cpp_module.finalize()
+    """Call after all requests finish and all users of the MPI runtime stop."""
+    global _world_group
+    if mpi_cpp_module is not None:
+        mpi_cpp_module.finalize()
+        _world_group = None
 
 
-def barrier():
-    return mpi_cpp_module.barrier()
-
-
-def send(tensor, rank, tag=0):
-    mpi_cpp_module.send(tensor, rank, tag)
-
-
-def recv(tensor, rank, tag=0):
-    mpi_cpp_module.recv(tensor, rank, tag)
-
-
-def all_reduce(tensor, op=None, group=None, async_op=False):
-    return mpi_cpp_module.allreduce(tensor, op, async_op)
-
-
-def alltoall(outputTensor, inputTensor, is_prof):
-    return mpi_cpp_module.alltoall(outputTensor, inputTensor, is_prof)
-
-
-def alltoall_list(outputTensors, inputTensors):
-    return mpi_cpp_module.alltoall(outputTensors, inputTensors)
-
-
-def send(tensor, rank, tag=0):
-    mpi_cpp_module.send(tensor, rank, tag)
-
-
-def recv(tensor, rank, tag=0):
-    mpi_cpp_module.recv(tensor, rank, tag)
-
-
-def isend(tensor, rank, tag=0, comm_index=0):
-    return mpi_cpp_module.isend(tensor, rank, tag, comm_index)
-
-
-def irecv(tensor, rank, tag=0, comm_index=0):
-    return mpi_cpp_module.irecv(tensor, rank, tag, comm_index)
-
-
-def allreduce(tensor, comm_index, is_prof):
-    return mpi_cpp_module.allreduce(tensor, comm_index, is_prof)
-
-
-def allgather(tensor, comm_index=0):
-    return mpi_cpp_module.allgather(tensor, 0)
-
-
-def gather(tensor, root_rank, comm_index=0):
-    return mpi_cpp_module.gather(tensor, root_rank, comm_index=0)
-
-
-#def scatter(tensor, root_rank, tag=0, comm_index=0):
-#        return mpi_cpp_module.scatter(tensor, root_rank, tag=0, comm_index=0)
-
-
-def reduce_scatter(tensor, comm_index=0):
-    return mpi_cpp_module.reduce_scatter(tensor, comm_index=0)
-
-
-def reduce(tensor, root_rank, comm_index=0):
-    return mpi_cpp_module.reduce(tensor, root_rank, comm_index=0)
-
-
-def bcast(tensor, root_rank, comm_index=0):
-    return mpi_cpp_module.bcast(tensor, root_rank, comm_index=0)
-
-
-def alltoall(outputTensor, inputTensor, comm_index=0, is_prof=0):
-    return mpi_cpp_module.alltoall(outputTensor, inputTensor, comm_index, is_prof)
-
-
-def alltoall_list(outputTensors, inputTensors, comm_index=0, is_prof=0):
-    return mpi_cpp_module.alltoall(outputTensors, inputTensors, comm_index, is_prof)
-
-
-def wait(req):
-    mpi_cpp_module.wait(req)
-
-
-def wait_multi(req, tensor):
-    return mpi_cpp_module.wait_multi(req, tensor)
-
-
-def create_comms(number=1):
-    mpi_cpp_module.create_comms(number)
-
-
-def cuda_sync():
-    mpi_cpp_module.device_sync()
-
-
-def print_comms():
-    mpi_cpp_module.print_comm_number()
+# Tensor operations live on NativeGroup. The public MPIBackend handles tensor
+# lists and world-rank translation instead of duplicating communication here.

@@ -16,128 +16,271 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Adapt the public MCR-DL API to NativeGroup's contiguous tensor operations."""
+
 import torch
 import torch.distributed as dist
 
-from mcr_dl.ops.comm.mpi import build_mpi_op
+from mcr_dl.ops.comm.mpi import build_mpi_op, initialize
 from mcr_dl.utils import logger
 
-from .utils import *
-from .backend import *
-from .comm import ReduceOp
-
-cupy = None
+from .backend import Backend
+from .reduce_op import ReduceOp
 
 
 class MPIBackend(Backend):
     def __init__(self, name='mpi', rank=0, size=1, mpu=None):
-        super(MPIBackend, self).__init__()
-        # has_allgather_base is needed for torch. Included here for compatibility with ds comms
-        self.has_allgather_base = True
-        self.name = 'mpi'
+        super().__init__(name='mpi')
         self.mpi_comm_op = build_mpi_op()
-        #self.reduce_op = build_op().ReduceOp
-        self.mpi_comm_op.initialize()
-        #self.rank = get_local_rank_from_launcher()
-        #self.size = get_world_size_from_launcher()
-        self.rank = self.mpi_comm_op.get_rank(0)
-        self.size = self.mpi_comm_op.get_world_size(0)
+        self.has_allgather_base = True
+        self.has_all_reduce_coalesced = False
+        self.has_coalescing_manager = False
         self.enable_onebit = False
+        self.using_mpi = True
+        self.mpu = mpu
         self.init_process_group()
 
-        if mpu is not None:
-            # handle the mpu case later
-            #self.world_group = dist.new_group(ranks=range(dist.get_world_size()))
-            self.mpu = mpu
-            #self.world_group = self.mpu.get_data_parallel_group()
-
-    def has_all_gather_into_tensor(self):
-        return self.all_gather_base is not None
-
     def init_process_group(self):
-        logger.info(
-            f"Initializing MCR-DL's {self.name} Communication Backend with rank = {self.rank} and size = {self.size}"
-        )
-        if self.size <= 0:
-            # Do not initialize torch distributed but only yourself
-            self.initialized = True
-            # Future functionality to support ds.initialize() on a single GPU
-            self.single_gpu_mode = True
-        else:
-            self.mpi_comm_op.initialize()
-            self.initialized = True
-            self.single_gpu_mode = False
+        if self.initialized:
+            return
+        self.world_group = initialize()
+        self.rank = self.world_rank = self.world_group.rank()
+        self.size = self.world_size = self.world_group.size()
+        self.single_gpu_mode = self.size == 1
+        # Keep world ranks in communicator order for source/destination translation.
+        self._group_ranks = {self.world_group: tuple(range(self.size))}
+        self.initialized = True
+        logger.info(f"Initialized MCR-DL MPI with rank {self.rank} and world size {self.size}")
+
+    def new_group(self, ranks=None):
+        self._group()
+        ranks = tuple(range(self.size) if ranks is None else sorted(ranks))
+        if (not ranks or len(set(ranks)) != len(ranks)
+                or any(not isinstance(rank, int) or rank < 0 or rank >= self.size for rank in ranks)):
+            raise ValueError("Group ranks must be distinct integers within the MPI world")
+        # None means the world group, so nonmembers need a different sentinel.
+        if self.rank not in ranks:
+            return dist.GroupMember.NON_GROUP_MEMBER
+        # Members must construct overlapping groups in the same order.
+        group = self.mpi_comm_op.NativeGroup(list(ranks))
+        self._group_ranks[group] = ranks
+        return group
 
     def destroy_process_group(self, group=None):
-        pass
+        if group == dist.GroupMember.NON_GROUP_MEMBER:
+            return
+        if group is None or group is self.world_group:
+            self._group_ranks.clear()
+            self.world_group = None
+            self.initialized = False
+        else:
+            del self._group_ranks[self._group(group)]
+        # MPI and its communicators live until explicit finalize(), since NCCL
+        # may still use the shared runtime after this Python backend is destroyed.
 
-    def new_group(self, ranks):
-        # TODO: Change this to use self.mpi_comm_op.new_group(ranks) when the impl. is ready.
-        if not torch.distributed.is_initialized():
-            from mcr_dl.torch import TorchBackend
-            d = TorchBackend(rank=self.rank, world_size=self.size)
-        logger.info(f"new group called with {ranks}")
-        return torch.distributed.new_group(ranks)
-        # return self.mpi_comm_op.new_group(ranks)
+    def _group(self, group=None, async_op=False):
+        if not self.initialized:
+            raise RuntimeError("The MPI backend is not initialized")
+        if group == dist.GroupMember.NON_GROUP_MEMBER:
+            return None
+        # Native collectives block. Only isend/irecv return NativeRequest objects.
+        if async_op:
+            raise NotImplementedError("Native MPI collectives do not support async_op=True")
+        group = self.world_group if group is None else group
+        if group not in self._group_ranks:
+            raise ValueError("Use a group created by this MPI backend")
+        return group
+
+    def _group_rank(self, group, world_rank):
+        if world_rank is None:
+            raise NotImplementedError("Native MPI requires an explicit source rank")
+        try:
+            return self._group_ranks[group].index(world_rank)
+        except ValueError:
+            raise ValueError(f"World rank {world_rank} is not in the group") from None
+
+    def get_world_group(self):
+        return self._group()
 
     def get_rank(self, group=None):
-        return self.mpi_comm_op.get_rank(0)
+        native = self._group(group)
+        return -1 if native is None else native.rank()
 
     def get_world_size(self, group=None):
-        return self.mpi_comm_op.get_world_size(0)
+        native = self._group(group)
+        return -1 if native is None else native.size()
 
-    def is_initialized(self):
-        return self.initialized
+    def get_global_rank(self, group, group_rank):
+        native = self._group(group)
+        if native is None or not 0 <= group_rank < native.size():
+            raise RuntimeError("Group rank is out of range")
+        return self._group_ranks[native][group_rank]
+
+    @staticmethod
+    def _reduce_op(op):
+        # PyTorch's enum values differ from MCR-DL's; match names, not integers.
+        enum = ReduceOp if isinstance(op, ReduceOp) else dist.ReduceOp
+        for code, name in enumerate(('SUM', 'PRODUCT', 'MIN', 'MAX')):
+            if op == getattr(enum, name):
+                return code
+        raise ValueError("Native MPI supports SUM, PRODUCT, MIN and MAX reductions")
 
     def barrier(self, group=None, async_op=False):
-        return self.mpi_comm_op.barrier()
+        native = self._group(group, async_op)
+        if native is not None:
+            native.barrier()
 
     def broadcast(self, tensor, src, op=ReduceOp.SUM, group=None, async_op=False):
-        # TODO: Fix calls to op. Fix op to support groups and async
-        self.mpi_comm_op.bcast(tensor, src, op)  #, group=group, async_op=async_op)
+        # Keep the public op argument for compatibility; broadcast does not reduce.
+        native = self._group(group, async_op)
+        if native is not None:
+            native.broadcast(tensor, self._group_rank(native, src))
 
-    def send(self, tensor, dst, group=None, tag=0):
-        self.mpi_comm_op.send(tensor, dst, tag)
+    def all_reduce(self, tensor, op=ReduceOp.SUM, group=None, async_op=False, is_prof=False):
+        native = self._group(group, async_op)
+        if native is not None:
+            native.all_reduce(tensor, self._reduce_op(op), is_prof)
 
-    def recv(self, tensor, src=None, group=None, tag=0):
-        self.mpi_comm_op.recv(tensor, src, tag)
-
-    def all_reduce(self, tensor, op=ReduceOp.SUM, group=None, async_op=False):
-        self.mpi_comm_op.allreduce(tensor, op, async_op)
+    inference_all_reduce = all_reduce
 
     def reduce(self, tensor, dst, op=ReduceOp.SUM, group=None, async_op=False):
-        self.mpi_comm_op.reduce(tensor, dst, op, async_op)
+        native = self._group(group, async_op)
+        if native is not None:
+            native.reduce(tensor, self._group_rank(native, dst), self._reduce_op(op))
 
-    def reduce_scatter(self,
-                       output,
-                       input_list,
-                       op=ReduceOp.SUM,
-                       group=None,
-                       async_op=False):
-        self.mpi_comm_op.reduce_scatter(input_list, op, async_op)
+    def send(self, tensor, dst, group=None, tag=0):
+        native = self._group(group)
+        if native is not None:
+            native.send(tensor, self._group_rank(native, dst), tag)
 
-    def all_gather(self, tensor_list, tensor, group=None, async_op=False):
-        self.mpi_comm_op.allgather_list([tensor_list], [tensor], async_op)
+    def recv(self, tensor, src=None, group=None, tag=0):
+        native = self._group(group)
+        if native is None:
+            return -1
+        native.recv(tensor, self._group_rank(native, src), tag)
+        return src
 
-    def all_gather_base(self, output_tensor, input_tensor, group=None, async_op=False):
-        self.mpi_comm_op.allgather(output_tensor, input_tensor, async_op)
+    def isend(self, tensor, dst, group=None, tag=0):
+        native = self._group(group)
+        if native is not None:
+            return native.isend(tensor, self._group_rank(native, dst), tag)
+
+    def irecv(self, tensor, src=None, group=None, tag=0):
+        native = self._group(group)
+        if native is not None:
+            return native.irecv(tensor, self._group_rank(native, src), tag)
+
+    def has_all_gather_into_tensor(self):
+        return True
+
+    def has_reduce_scatter_tensor(self):
+        return True
 
     def all_gather_into_tensor(self, output_tensor, input_tensor, group=None, async_op=False):
-        self.mpi_comm_op.allgather(output_tensor, input_tensor, async_op)
+        native = self._group(group, async_op)
+        if native is not None:
+            native.all_gather(output_tensor, input_tensor)
 
-    def all_to_all_single(self,
-                          output,
-                          input,
-                          output_split_sizes=None,
-                          input_split_sizes=None,
-                          op=ReduceOp.SUM,
-                          group=None,
-                          async_op=False):
-        self.mpi_comm_op.alltoall(output, input, op, async_op)
+    all_gather_base = all_gather_into_tensor
 
-    def all_to_all(self,
-                   output_tensor_list,
-                   input_tensor_list,
-                   group=None,
-                   async_op=False):
-        self.mpi_comm_op.alltoall_list(output_tensor_list, input_tensor_list, async_op)
+    def reduce_scatter_tensor(self, output_tensor, input_tensor, op=ReduceOp.SUM,
+                              group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is not None:
+            native.reduce_scatter(output_tensor, input_tensor, self._reduce_op(op))
+
+    @staticmethod
+    def _check_list(tensors, reference, size):
+        if not isinstance(tensors, (list, tuple)) or len(tensors) != size:
+            raise ValueError("Provide one tensor per group rank")
+        if not isinstance(reference, torch.Tensor):
+            raise TypeError("Expected a tensor")
+        for tensor in tensors:
+            if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
+                    or tensor.numel() != reference.numel() or tensor.dtype != reference.dtype
+                    or tensor.device != reference.device):
+                raise ValueError("Tensor lists must have equal element counts, dtype and device")
+
+    @staticmethod
+    def _pack(tensors):
+        # The native API takes one contiguous buffer, ordered by group rank.
+        with torch.no_grad():
+            return torch.cat([tensor.reshape(-1) for tensor in tensors])
+
+    @staticmethod
+    def _unpack(packed, tensors):
+        # Copy into the caller's tensors so list entries keep their identity.
+        with torch.no_grad():
+            for rank, tensor in enumerate(tensors):
+                part = packed.narrow(0, rank * tensor.numel(), tensor.numel())
+                tensor.copy_(part.reshape(tensor.shape))
+
+    def all_gather(self, tensor_list, tensor, group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is not None:
+            self._check_list(tensor_list, tensor, native.size())
+            packed = tensor.new_empty((native.size() * tensor.numel(),))
+            native.all_gather(packed, tensor)
+            self._unpack(packed, tensor_list)
+
+    def reduce_scatter(self, output, input_list, op=ReduceOp.SUM, group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is not None:
+            self._check_list(input_list, output, native.size())
+            native.reduce_scatter(output, self._pack(input_list), self._reduce_op(op))
+
+    def gather(self, tensor, gather_list=None, dst=0, group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is None:
+            return
+        root = self._group_rank(native, dst)
+        packed = None
+        if native.rank() == root:
+            self._check_list(gather_list, tensor, native.size())
+            packed = tensor.new_empty((native.size() * tensor.numel(),))
+        elif gather_list:
+            raise ValueError("Only the destination rank supplies gather_list")
+        native.gather(packed, tensor, root)
+        if packed is not None:
+            self._unpack(packed, gather_list)
+
+    def scatter(self, tensor, scatter_list=None, src=0, group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is None:
+            return
+        root = self._group_rank(native, src)
+        packed = None
+        if native.rank() == root:
+            self._check_list(scatter_list, tensor, native.size())
+            packed = self._pack(scatter_list)
+        elif scatter_list:
+            raise ValueError("Only the source rank supplies scatter_list")
+        native.scatter(tensor, packed, root)
+
+    def all_to_all_single(self, output, input, output_split_sizes=None, input_split_sizes=None,
+                          op=ReduceOp.SUM, group=None, async_op=False, is_prof=False):
+        native = self._group(group, async_op)
+        if native is None:
+            return
+        # Public split sizes count rows; NativeGroup exchanges equal flat chunks.
+        for tensor, splits in ((input, input_split_sizes), (output, output_split_sizes)):
+            if tensor.dim() == 0 or tensor.shape[0] % native.size() != 0:
+                raise ValueError("Equal-split all_to_all requires rows divisible by group size")
+            if splits is not None and len(splits) != 0:
+                if (len(splits) != native.size()
+                        or any(split != tensor.shape[0] // native.size() for split in splits)):
+                    raise NotImplementedError("Native MPI all_to_all supports only equal splits")
+        native.all_to_all(output, input, is_prof)
+
+    def all_to_all(self, output_tensor_list, input_tensor_list, group=None, async_op=False):
+        native = self._group(group, async_op)
+        if native is not None:
+            if not input_tensor_list:
+                raise ValueError("Provide one input tensor per group rank")
+            reference = input_tensor_list[0]
+            self._check_list(input_tensor_list, reference, native.size())
+            self._check_list(output_tensor_list, reference, native.size())
+            packed_input = self._pack(input_tensor_list)
+            packed_output = torch.empty_like(packed_input)
+            native.all_to_all(packed_output, packed_input)
+            self._unpack(packed_output, output_tensor_list)
