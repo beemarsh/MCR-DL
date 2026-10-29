@@ -228,10 +228,14 @@ def set_backend():
             cdb = hccl_backend
 
 
+# stream= is an MPI extension. Forward it only when supplied so existing NCCL
+# and torch calls retain their backend signatures.
+
 @timed_op
-def broadcast(tensor, src, op=ReduceOp.SUM, group=None, async_op=False, prof=False, log_name='broadcast', debug=get_caller_func()):
+def broadcast(tensor, src, op=ReduceOp.SUM, group=None, async_op=False, prof=False, log_name='broadcast', debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.broadcast(tensor=tensor, src=src, op=op, group=group, async_op=async_op)
+    return cdb.broadcast(tensor=tensor, src=src, op=op, group=group, async_op=async_op,
+                         **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -241,9 +245,10 @@ def all_gather(tensor_list,
                async_op=False,
                prof=False,
                log_name='all_gather',
-               debug=get_caller_func()):
+               debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.all_gather(tensor_list=tensor_list, tensor=tensor, group=group, async_op=async_op)
+    return cdb.all_gather(tensor_list=tensor_list, tensor=tensor, group=group, async_op=async_op,
+                          **({"stream": stream} if stream is not None else {}))
 
 
 def has_reduce_scatter_tensor():
@@ -259,7 +264,7 @@ def reduce_scatter_fn(output_tensor,
                       group=None,
                       async_op=False,
                       prof=False,
-                      debug=get_caller_func()):
+                      debug=get_caller_func(), *, stream=None):
     global cdb
     assert cdb is not None and cdb.is_initialized(
     ), 'MCR-DL backend not set, please initialize it using init_process_group()'
@@ -270,7 +275,7 @@ def reduce_scatter_fn(output_tensor,
                                      group=group,
                                      async_op=async_op,
                                      prof=prof,
-                                     debug=debug)
+                                     debug=debug, stream=stream)
     else:
         if get_rank() == 0:
             utils.logger.warning_once("unable to find torch.distributed.reduce_scatter_tensor. will fall back to "
@@ -283,7 +288,7 @@ def reduce_scatter_fn(output_tensor,
                               group=group,
                               async_op=async_op,
                               prof=prof,
-                              debug=debug)
+                              debug=debug, stream=stream)
 
 
 @timed_op
@@ -294,13 +299,13 @@ def reduce_scatter_tensor(output_tensor,
                           async_op=False,
                           prof=False,
                           log_name='reduce_scatter_tensor',
-                          debug=get_caller_func()):
+                          debug=get_caller_func(), *, stream=None):
     global cdb
     return cdb.reduce_scatter_tensor(output_tensor=output_tensor,
                                      input_tensor=tensor,
                                      op=op,
                                      group=group,
-                                     async_op=async_op)
+                                     async_op=async_op, **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -310,9 +315,10 @@ def all_gather_into_tensor(output_tensor,
                            async_op=False,
                            prof=False,
                            log_name='all_gather_into_tensor',
-                           debug=get_caller_func()):
+                           debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=tensor, group=group, async_op=async_op)
+    return cdb.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=tensor, group=group, async_op=async_op,
+                                      **({"stream": stream} if stream is not None else {}))
 
 
 def has_all_gather_into_tensor():
@@ -322,19 +328,21 @@ def has_all_gather_into_tensor():
     return cdb.has_all_gather_into_tensor()
 
 
-def allgather_fn(output_tensor, input_tensor, group=None, async_op=False, debug=get_caller_func()):
+def allgather_fn(output_tensor, input_tensor, group=None, async_op=False, debug=get_caller_func(), *, stream=None):
     global cdb
     assert cdb is not None and cdb.is_initialized(
     ), 'MCR-DL backend not set, please initialize it using init_process_group()'
     if cdb.has_all_gather_into_tensor():
-        return all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op, debug=debug)
+        return all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op, debug=debug,
+                                      stream=stream)
     else:
         if get_rank() == 0:
             utils.logger.warning_once("unable to find torch.distributed.all_gather_into_tensor. will fall back to "
                                       "torch.distributed.all_gather which will result in suboptimal performance. "
                                       "please consider upgrading your pytorch installation.")
         output_tensors = list(torch.chunk(output_tensor, cdb.get_world_size(group)))
-        return all_gather(output_tensors, input_tensor, group=group, async_op=async_op, debug=debug)
+        return all_gather(output_tensors, input_tensor, group=group, async_op=async_op, debug=debug,
+                          stream=stream)
 
 
 @timed_op
@@ -347,7 +355,7 @@ def all_to_all_single(output,
                       async_op=False,
                       prof=False,
                       log_name='all_to_all_single',
-                      debug=get_caller_func()):
+                      debug=get_caller_func(), *, stream=None):
     global cdb
     return cdb.all_to_all_single(output=output,
                                  input=tensor,
@@ -355,40 +363,45 @@ def all_to_all_single(output,
                                  input_split_sizes=input_split_sizes,
                                  op=op,
                                  group=group,
-                                 async_op=async_op)
+                                 async_op=async_op, **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
-def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False):
+def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False, *, stream=None):
     global cdb
-    return cdb.all_to_all(output_tensor_list, input_tensor_list, group=group, async_op=async_op)
+    return cdb.all_to_all(output_tensor_list, input_tensor_list, group=group, async_op=async_op,
+                          **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
-def send(tensor, dst, group=None, tag=0, prof=False, log_name='send', debug=get_caller_func()):
+def send(tensor, dst, group=None, tag=0, prof=False, log_name='send', debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.send(tensor=tensor, dst=dst, group=group, tag=tag)
+    return cdb.send(tensor=tensor, dst=dst, group=group, tag=tag,
+                    **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
-def recv(tensor, src=None, group=None, tag=0, prof=False, log_name='recv', debug=get_caller_func()):
+def recv(tensor, src=None, group=None, tag=0, prof=False, log_name='recv', debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.recv(tensor=tensor, src=src, group=group, tag=tag)
+    return cdb.recv(tensor=tensor, src=src, group=group, tag=tag,
+                    **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
-def isend(tensor, dst, group=None, tag=0, prof=False, log_name='isend', debug=get_caller_func()):
+def isend(tensor, dst, group=None, tag=0, prof=False, log_name='isend', debug=get_caller_func(), *, stream=None):
     global cdb
     # Use request-returning operations when the backend provides them.
     send_op = getattr(cdb, 'isend', cdb.send)
-    return send_op(tensor=tensor, dst=dst, group=group, tag=tag)
+    return send_op(tensor=tensor, dst=dst, group=group, tag=tag,
+                   **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
-def irecv(tensor, src=None, group=None, tag=0, prof=False, log_name='irecv', debug=get_caller_func()):
+def irecv(tensor, src=None, group=None, tag=0, prof=False, log_name='irecv', debug=get_caller_func(), *, stream=None):
     global cdb
     recv_op = getattr(cdb, 'irecv', cdb.recv)
-    return recv_op(tensor=tensor, src=src, group=group, tag=tag)
+    return recv_op(tensor=tensor, src=src, group=group, tag=tag,
+                   **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -399,9 +412,10 @@ def gather(tensor,
            async_op=False,
            prof=False,
            log_name='gather',
-           debug=get_caller_func()):
+           debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.gather(tensor=tensor, gather_list=gather_list, dst=dst, group=group, async_op=async_op)
+    return cdb.gather(tensor=tensor, gather_list=gather_list, dst=dst, group=group, async_op=async_op,
+                      **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -412,9 +426,10 @@ def scatter(tensor,
             async_op=False,
             prof=False,
             log_name='scatter',
-            debug=get_caller_func()):
+            debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.scatter(tensor=tensor, scatter_list=scatter_list, src=src, group=group, async_op=async_op)
+    return cdb.scatter(tensor=tensor, scatter_list=scatter_list, src=src, group=group, async_op=async_op,
+                       **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -452,9 +467,10 @@ def reduce(tensor,
            async_op=False,
            prof=False,
            log_name='reduce',
-           debug=get_caller_func()):
+           debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.reduce(tensor=tensor, dst=dst, op=op, group=group, async_op=async_op)
+    return cdb.reduce(tensor=tensor, dst=dst, op=op, group=group, async_op=async_op,
+                      **({"stream": stream} if stream is not None else {}))
 
 
 @timed_op
@@ -465,9 +481,10 @@ def reduce_scatter(output,
                    async_op=False,
                    prof=False,
                    log_name='reduce_scatter',
-                   debug=get_caller_func()):
+                   debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.reduce_scatter(output=output, input_list=input_list, op=op, group=group, async_op=async_op)
+    return cdb.reduce_scatter(output=output, input_list=input_list, op=op, group=group, async_op=async_op,
+                              **({"stream": stream} if stream is not None else {}))
 
 
 def has_all_reduce_coalesced():
@@ -501,14 +518,12 @@ def all_reduce(tensor,
                async_op=False,
                prof=False,
                log_name='all_reduce',
-               debug=get_caller_func()):
-    #if profile_comm:
-    # context of the timers?
-    # timers.start()
-    # TensorBoard logging for comm calls.?
+               debug=get_caller_func(), *, stream=None):
+    """Reduce in place. MPI accepts stream=; see docs/mpi_streams.md for ordering."""
     global cdb
-    #print(f'op = {op}, cdb= {cdb.name}')
-    return cdb.all_reduce(tensor, op, group, async_op)
+    if stream is None:
+        return cdb.all_reduce(tensor, op, group, async_op)
+    return cdb.all_reduce(tensor, op, group, async_op, stream=stream)
 
 
 @timed_op
@@ -518,9 +533,11 @@ def inference_all_reduce(tensor,
                          async_op=False,
                          prof=False,
                          log_name='all_reduce',
-                         debug=get_caller_func()):
+                         debug=get_caller_func(), *, stream=None):
     global cdb
-    return cdb.inference_all_reduce(tensor, op, group, async_op)
+    if stream is None:
+        return cdb.inference_all_reduce(tensor, op, group, async_op)
+    return cdb.inference_all_reduce(tensor, op, group, async_op, stream=stream)
 
 
 @timed_op
