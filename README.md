@@ -33,13 +33,60 @@ python setup.py install
 Update mpi, cuda, and nccl paths appropriately in [mcr_dl/config.yml](/mcr_dl/build_config.yml)
 Example is available at: [mcr_dl/build.config.example.yaml](mcr_dl/build.config.example.yaml)
 
-### The MCR-DL Communication Benchmarking Suite
+## Usage: MPI all-reduce
+
+Run one MPI process per GPU with a CUDA-aware MPI library. This example uses `MPIBackend` directly, which also makes the native MPI backend choice explicit when integrating with an application that already initializes `torch.distributed`. Save it as `mpi_all_reduce.py`:
+
+```python
+import os
+
+import torch
+from mcr_dl.mpi import MPIBackend
+from mcr_dl.ops.comm.mpi import finalize
+
+# Select this process's GPU before initializing CUDA-aware MPI.
+local_rank = int(os.environ["SLURM_LOCALID"])
+torch.cuda.set_device(0 if torch.cuda.device_count() == 1 else local_rank)
+
+comm = MPIBackend()
+rank = comm.get_rank()
+world_size = comm.get_world_size()
+
+# Tensor creation and the readiness event use the same current CUDA stream.
+stream = torch.cuda.current_stream()
+tensor = torch.full((1024,), rank + 1, device="cuda", dtype=torch.bfloat16)
+comm.all_reduce(tensor, stream=stream)  # Blocking, in-place SUM across all ranks.
+
+# The result is ready when all_reduce returns.
+expected = world_size * (world_size + 1) // 2
+assert torch.all(tensor == expected).item()
+if rank == 0:
+    print(f"All-reduce passed on {world_size} ranks; each element is {expected}.")
+
+comm.destroy_process_group()
+finalize()
+```
+
+### CUDA stream
+
+The native MPI tensor API accepts `stream=`, a `torch.cuda.Stream` on the tensor's device. Omitting it uses the current stream on that device. MCR-DL records a reusable CUDA event on the selected stream, waits for it on the CPU, and then calls MPI.
+**The caller must establish the buffer's stream dependencies before calling MCR-DL.** All earlier conflicting reads and writes of input and output buffers must be ordered before that event. If another stream produced the tensor, make the selected stream wait for that producer before the all-reduce:
+
+```python
+stream.wait_stream(producer_stream)  # After submitting the producer's work.
+comm.all_reduce(tensor, stream=stream)
+```
+
+MPI collectives are blocking; `async_op=True` and CUDA graph capture
+are unsupported.
+
+## Benchmarking Suite
 
 The intent of these benchmarks is to measure communication latency/bw of MCR-DL and/or pytorch distributed communication operations at the Python layer. These benchmarks are complementary to C-level comms benchmarks like [OSU Micro-Benchmarks](https://mvapich.cse.ohio-state.edu/benchmarks/) and [NCCL Tests](https://github.com/NVIDIA/nccl-tests) in that users can:
 - Easily debug which layer of the communication software stack hangs or performance degradations originate from.
 - Measure the expected communication performance of either MCR-DL comms or pure PyTorch distributed
 
-To run benchmarks, there are two options:
+To run the existing benchmarks, there are two options:
 
 1. Run a single communication operation:
 
