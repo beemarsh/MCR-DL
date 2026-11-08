@@ -302,16 +302,16 @@ namespace mpi
 
         void all_reduce(torch::Tensor tensor, int op, bool is_prof = false, Stream stream = std::nullopt)
         {
-            c10::OptionalDeviceGuard guard;
-            prepare(tensor, guard, stream);
-            const auto reduction = reduction_op(op);
-            const auto datatype = get_mpi_datatype(tensor.scalar_type());
-            const auto elements = count(tensor);
-            const auto begin = is_prof ? Clock::now() : Clock::time_point{};
-            MPICHECK(MPI_Allreduce(MPI_IN_PLACE, tensor.data_ptr(), elements,
-                                   datatype, reduction, comm_));
-            if (is_prof)
-                print_elapsed("all_reduce", begin, tensor);
+            all_reduce_impl(tensor, tensor, op, is_prof, stream);
+        }
+
+        void all_reduce(torch::Tensor output, torch::Tensor input, int op,
+                        bool is_prof = false, Stream stream = std::nullopt)
+        {
+            check_buffers(output, input);
+            TORCH_CHECK(output.numel() == input.numel(),
+                        "MCR-DL all_reduce requires equally sized input and output tensors");
+            all_reduce_impl(output, input, op, is_prof, stream);
         }
 
         void all_gather(torch::Tensor output, torch::Tensor input, Stream stream = std::nullopt)
@@ -478,6 +478,22 @@ namespace mpi
         // Created on first use; PyTorch's event wrapper handles device-aware cleanup.
         std::map<int, at::cuda::CUDAEvent> ready_events_;
 
+        void all_reduce_impl(const torch::Tensor &output, const torch::Tensor &input,
+                             int op, bool is_prof, const Stream &stream)
+        {
+            c10::OptionalDeviceGuard guard;
+            prepare(input, guard, stream);
+            const auto reduction = reduction_op(op);
+            const auto datatype = get_mpi_datatype(input.scalar_type());
+            const auto elements = count(input);
+            const bool in_place = output.is_same(input);
+            const auto begin = is_prof ? Clock::now() : Clock::time_point{};
+            MPICHECK(MPI_Allreduce(in_place ? MPI_IN_PLACE : input.data_ptr(),
+                                   output.data_ptr(), elements, datatype, reduction, comm_));
+            if (is_prof)
+                print_elapsed(in_place ? "all_reduce" : "all_reduce_out", begin, input);
+        }
+
         static MPI_Op reduction_op(int op)
         {
             switch (op)
@@ -608,9 +624,20 @@ namespace mpi
             .def(py::init<std::vector<int>>(), py::call_guard<py::gil_scoped_release>())
             .def("rank", &NativeGroup::rank)
             .def("size", &NativeGroup::size)
-            .def("all_reduce", &NativeGroup::all_reduce,
+            .def("all_reduce", py::overload_cast<torch::Tensor, int, bool, Stream>(&NativeGroup::all_reduce),
                  "In-place reduction; is_prof prints MPI-only latency on group rank zero.",
                  py::arg("tensor"), py::arg("op"), py::arg("is_prof") = false,
+                 py::kw_only(), py::arg("stream") = py::none(),
+                 py::call_guard<py::gil_scoped_release>())
+            .def("all_reduce", py::overload_cast<torch::Tensor, torch::Tensor, int, bool, Stream>(&NativeGroup::all_reduce),
+                 "Reduce input into a distinct output of equal size, dtype and device.",
+                 py::arg("output"), py::arg("input"), py::arg("op"), py::arg("is_prof") = false,
+                 py::kw_only(), py::arg("stream") = py::none(),
+                 py::call_guard<py::gil_scoped_release>())
+            .def("all_reduce_out", py::overload_cast<torch::Tensor, torch::Tensor, int, bool, Stream>(&NativeGroup::all_reduce),
+                 "Reduce input into a distinct output of equal size, dtype and device. "
+                 "Buffers must not overlap; is_prof prints MPI-only latency on group rank zero.",
+                 py::arg("output"), py::arg("input"), py::arg("op"), py::arg("is_prof") = false,
                  py::kw_only(), py::arg("stream") = py::none(),
                  py::call_guard<py::gil_scoped_release>())
             .def("all_gather", &NativeGroup::all_gather,

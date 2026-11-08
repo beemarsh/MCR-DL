@@ -169,6 +169,23 @@ class TorchBackend(Backend):
         op = self._reduce_op(op)
         return torch.distributed.all_reduce(tensor=tensor, op=op, group=group, async_op=async_op)
 
+    def all_reduce_out(self, output_tensor, input_tensor, op=torch.distributed.ReduceOp.SUM,
+                       group=None, async_op=False):
+        if group == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            return
+        if (output_tensor.layout != torch.strided or input_tensor.layout != torch.strided
+                or not output_tensor.is_contiguous() or not input_tensor.is_contiguous()):
+            raise ValueError("MCR-DL all_reduce_out requires dense contiguous input and output tensors")
+        if (output_tensor.numel() != input_tensor.numel() or output_tensor.dtype != input_tensor.dtype
+                or output_tensor.device != input_tensor.device):
+            raise ValueError("MCR-DL all_reduce_out input and output must have equal size, dtype and device")
+        size = input_tensor.numel() * input_tensor.element_size()
+        if size and abs(output_tensor.data_ptr() - input_tensor.data_ptr()) < size:
+            raise ValueError("MCR-DL all_reduce_out input and output buffers must not overlap")
+        with torch.no_grad():
+            output_tensor.view(-1).copy_(input_tensor.view(-1))
+        return self.all_reduce(output_tensor, op=op, group=group, async_op=async_op)
+
     def inference_all_reduce(self, tensor, op=torch.distributed.ReduceOp.SUM, group=None, async_op=False):
         op = self._reduce_op(op)
         return torch.distributed.all_reduce(tensor=tensor, op=op, group=group, async_op=async_op)

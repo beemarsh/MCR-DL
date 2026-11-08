@@ -27,20 +27,35 @@ from constants import *
 from mcr_dl.cuda_accelerator import get_accelerator
 
 
-def timed_all_reduce(input, start_event, end_event, args):
+def timed_all_reduce(input, output, start_event, end_event, args):
     import mcr_dl
     dist = mcr_dl.get_distributed_engine()
+
+    def all_reduce():
+        if args.in_place:
+            return dist.all_reduce(input, async_op=args.async_op)
+        if args.dist == 'mcr_dl':
+            work = dist.all_reduce_out(output, input, async_op=args.async_op)
+        else:
+            # torch.distributed exposes in-place all_reduce. Include the copy in
+            # its out-of-place timing, using the preallocated output buffer.
+            output.copy_(input)
+            work = dist.all_reduce(output, async_op=args.async_op)
+        if args.async_op and work is not None:
+            # Order the next copy after this reduction's access to output.
+            work.wait()
+        return work
 
     sync_all()
     # Warmups, establish connections, etc.
     for i in range(args.warmups):
-        dist.all_reduce(input, async_op=args.async_op)
+        all_reduce()
     sync_all()
 
     # time the actual comm op trials times and average it
     start_event.record()
     for i in range(args.trials):
-        dist.all_reduce(input, async_op=args.async_op)
+        all_reduce()
     end_event.record()
     sync_all()
     duration = start_event.elapsed_time(end_event) / 1000
@@ -64,7 +79,10 @@ def run_all_reduce(local_rank, args):
     dist = mcr_dl.get_distributed_engine()
 
     # Prepare benchmark header
-    print_header(args, 'all_reduce')
+    mode = 'in-place' if args.in_place else 'out-of-place'
+    print_header(args, f'all_reduce ({mode})')
+    if not args.in_place and args.dist == 'torch':
+        print_rank_0('torch out-of-place timing includes copying input into output before all_reduce.')
 
     world_size = dist.get_world_size()
     global_rank = dist.get_rank()
@@ -86,6 +104,7 @@ def run_all_reduce(local_rank, args):
                                  dtype=getattr(torch, args.dtype)).to(get_accelerator().device_name(local_rank))
                 sync_all()
                 input = ((mat.mul_(float(global_rank))).view(-1))
+                output = input if args.in_place else torch.empty_like(input)
             except RuntimeError as e:
                 if 'out of memory' in str(e):
                     if dist.get_rank() == 0:
@@ -95,19 +114,21 @@ def run_all_reduce(local_rank, args):
                 else:
                     raise e
             sync_all()
-            timed_all_reduce(input, start_event, end_event, args)
+            timed_all_reduce(input, output, start_event, end_event, args)
+            del mat, input, output
     else:
         # Send the biggest message size our GPUs can fit. If you're facing OOM errors, reduce the mem_factor
-        # Don't need output tensor, so we double mem_factor
+        # In-place needs one buffer; out-of-place reserves equal input/output buffers.
         elements_per_gpu = max_numel(comm_op='all_reduce',
                                      dtype=getattr(torch, args.dtype),
-                                     mem_factor=args.mem_factor * 2,
+                                     mem_factor=args.mem_factor * (2 if args.in_place else 1),
                                      local_rank=local_rank,
                                      args=args)
         try:
             mat = torch.ones(elements_per_gpu, dtype=getattr(torch,
                                                              args.dtype)).to(get_accelerator().device_name(local_rank))
             input = ((mat.mul_(float(global_rank))).view(-1))
+            output = input if args.in_place else torch.empty_like(input)
         except RuntimeError as e:
             if 'out of memory' in str(e):
                 if dist.get_rank() == 0:
@@ -117,7 +138,7 @@ def run_all_reduce(local_rank, args):
             else:
                 raise e
         sync_all()
-        timed_all_reduce(input, start_event, end_event, args)
+        timed_all_reduce(input, output, start_event, end_event, args)
 
 
 if __name__ == "__main__":

@@ -527,6 +527,27 @@ def all_reduce(tensor,
 
 
 @timed_op
+def all_reduce_out(output_tensor,
+                   input_tensor,
+                   op=ReduceOp.SUM,
+                   group=None,
+                   async_op=False,
+                   prof=False,
+                   log_name='all_reduce_out',
+                   debug=get_caller_func(), *, stream=None):
+    """Reduce input_tensor into output_tensor, preserving input_tensor.
+
+    Buffers must be dense, contiguous, nonoverlapping, and have equal element
+    counts, dtype and device. Return behavior matches all_reduce. MPI accepts
+    stream= with the same ordering requirements as all_reduce.
+    """
+    global cdb
+    if stream is None:
+        return cdb.all_reduce_out(output_tensor, input_tensor, op, group, async_op)
+    return cdb.all_reduce_out(output_tensor, input_tensor, op, group, async_op, stream=stream)
+
+
+@timed_op
 def inference_all_reduce(tensor,
                          op=ReduceOp.SUM,
                          group=None,

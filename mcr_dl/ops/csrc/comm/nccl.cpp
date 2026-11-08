@@ -29,6 +29,7 @@
 namespace py = pybind11;
 
 #include <c10/util/irange.h>
+#include <ATen/MemoryOverlap.h>
 
 #include <iostream>
 #include <string>
@@ -295,18 +296,40 @@ void recv(torch::Tensor data, int rank, int tag, bool block, py::object group, b
     if (async_op) { SynchComm(); }
 }
 
-void all_reduce(torch::Tensor& data, py::object op, bool block, py::object group, bool async_op)
+void all_reduce_impl(torch::Tensor& output, torch::Tensor& input,
+                     py::object op, bool block, py::object group, bool async_op)
 {
     ncclComm_t comm = _get_comm_from_group(group);
-    NCCLCHECK(ncclAllReduce(data.data_ptr(),
-                            data.data_ptr(),
-                            data.numel(),
-                            get_nccl_datatype(data),
-                            get_nccl_reduce_op(op, data),
+    NCCLCHECK(ncclAllReduce(input.data_ptr(),
+                            output.data_ptr(),
+                            input.numel(),
+                            get_nccl_datatype(input),
+                            get_nccl_reduce_op(op, input),
                             comm,
                             GetCommStream(async_op)));
     if (block) { CUDACHECK(cudaStreamSynchronize(GetCommStream(async_op))); }
     if (!async_op) { SynchComm(); }
+}
+
+void all_reduce(torch::Tensor& data, py::object op, bool block, py::object group, bool async_op)
+{
+    all_reduce_impl(data, data, op, block, group, async_op);
+}
+
+void all_reduce(torch::Tensor& output, torch::Tensor& input,
+                py::object op, bool block, py::object group, bool async_op)
+{
+    TORCH_CHECK(output.defined() && input.defined() &&
+                    output.is_cuda() && input.is_cuda() &&
+                    output.is_contiguous() && input.is_contiguous() &&
+                    !output.is_sparse() && !input.is_sparse(),
+                "MCR-DL NCCL requires dense contiguous CUDA input and output tensors");
+    TORCH_CHECK(output.scalar_type() == input.scalar_type() && output.device() == input.device(),
+                "MCR-DL NCCL input and output must have the same dtype and device");
+    TORCH_CHECK(output.numel() == input.numel(),
+                "MCR-DL all_reduce requires equally sized input and output tensors");
+    at::assert_no_overlap(output, input);
+    all_reduce_impl(output, input, op, block, group, async_op);
 }
 
 inline ncclComm_t GetNCCLComm(int comm_id = 0) { return _nccl_comms[comm_id]; }
@@ -685,7 +708,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("send", &send, "nccl send");
     m.def("recv", &recv, "nccl recv");
-    m.def("all_reduce", &all_reduce, "nccl all_reduce");
+    m.def("all_reduce", py::overload_cast<torch::Tensor&, py::object, bool, py::object, bool>(&all_reduce),
+          "nccl in-place all_reduce");
+    m.def("all_reduce", py::overload_cast<torch::Tensor&, torch::Tensor&, py::object, bool, py::object, bool>(&all_reduce),
+          "nccl out-of-place all_reduce (output, input, op, block, group, async_op)");
+    m.def("all_reduce_out", py::overload_cast<torch::Tensor&, torch::Tensor&, py::object, bool, py::object, bool>(&all_reduce),
+          "nccl out-of-place all_reduce (output, input, op, block, group, async_op)");
     m.def("broadcast", &broadcast, "nccl broadcast");
     m.def("all_to_all_single", &all_to_all_single, "nccl alltoall");
     m.def("all_toall_list", &all_to_all, "nccl alltoall list");

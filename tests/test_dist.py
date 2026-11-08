@@ -169,6 +169,25 @@ class TestDistAllReduce(DistributedTest):
         assert torch.all(x == result)
 
 
+class TestDistAllReduceOut(DistributedTest):
+    world_size = TestDistAllReduce.world_size
+
+    @pytest.mark.parametrize("op_name", ["SUM", "PRODUCT", "MIN", "MAX"])
+    def test(self, op_name):
+        if not hasattr(dist, "all_reduce_out"):
+            pytest.skip("Requires the MCR-DL all_reduce_out API")
+        input_tensor = torch.full((1, 3), dist.get_rank() + 1,
+                                  device=get_accelerator().device_name(), dtype=torch.float32)
+        original = input_tensor.clone()
+        expected = input_tensor.clone()
+        output_tensor = torch.empty_like(input_tensor)
+        op = getattr(dist.ReduceOp, op_name)
+        dist.all_reduce(expected, op=op)
+        dist.all_reduce_out(output_tensor, input_tensor, op=op)
+        torch.testing.assert_close(output_tensor, expected)
+        torch.testing.assert_close(input_tensor, original)
+
+
 # class TestDistInferenceAllReduce(DistributedTest):
 #     world_size = 4
 

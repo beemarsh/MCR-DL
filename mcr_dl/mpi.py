@@ -169,6 +169,13 @@ class MPIBackend(Backend):
 
     inference_all_reduce = all_reduce
 
+    def all_reduce_out(self, output_tensor, input_tensor, op=ReduceOp.SUM,
+                       group=None, async_op=False, is_prof=False, *, stream=None):
+        native = self._group(group, async_op)
+        if native is not None:
+            native.all_reduce_out(output_tensor, input_tensor, self._reduce_op(op),
+                                  is_prof, stream=_stream(stream))
+
     def reduce(self, tensor, dst, op=ReduceOp.SUM, group=None, async_op=False, *, stream=None):
         native = self._group(group, async_op)
         if native is not None:

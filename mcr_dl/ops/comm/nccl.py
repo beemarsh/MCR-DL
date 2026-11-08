@@ -58,7 +58,11 @@ def recv(tensor, rank, tag=0):
 
 
 def all_reduce(tensor, op=None, group=None, async_op=False):
-    return nccl_cpp_module.allreduce(tensor, op, async_op)
+    return nccl_cpp_module.all_reduce(tensor, op, False, group, async_op)
+
+
+def all_reduce_out(output_tensor, input_tensor, op=None, group=None, async_op=False):
+    return nccl_cpp_module.all_reduce_out(output_tensor, input_tensor, op, False, group, async_op)
 
 
 def all_to_all_single(outputTensor, inputTensor, async_op=False):

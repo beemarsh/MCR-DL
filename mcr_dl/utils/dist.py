@@ -81,6 +81,8 @@ def get_tensor_position(func):
     # most colls
     if 'tensor' in sig_params:
         arg = 'tensor'
+    elif 'input_tensor' in sig_params:
+        arg = 'input_tensor'
     # all_reduce_coalesced coll
     elif 'tensors' in sig_params:
         arg = 'tensors'
@@ -103,6 +105,8 @@ def get_tensor_kwarg(func, kwargs):
 
     if 'tensor' in func_args:
         arg = func_args['tensor']
+    elif 'input_tensor' in func_args:
+        arg = func_args['input_tensor']
     elif 'tensors' in func_args:
         arg = func_args['tensors']
     elif 'input_list' in func_args:
@@ -122,8 +126,8 @@ def get_msg_size_from_args(func, *args, **kwargs):
     # check if tensor arg is in args
     if len(args) > 0:
         tensor_arg_position = get_tensor_position(func)
-        if tensor_arg_position > -1:
-            tensor_arg = args[get_tensor_position(func)]
+        if 0 <= tensor_arg_position < len(args):
+            tensor_arg = args[tensor_arg_position]
     # check if tensor arg is in kwargs
     if tensor_arg is None and len(kwargs) > 0:
         tensor_arg = get_tensor_kwarg(func, kwargs)

@@ -67,6 +67,24 @@ comm.destroy_process_group()
 finalize()
 ```
 
+To preserve the input, supply a separate output tensor:
+
+```python
+input_tensor = torch.full((1024,), rank + 1, device="cuda", dtype=torch.bfloat16)
+output_tensor = torch.empty_like(input_tensor)
+comm.all_reduce_out(output_tensor, input_tensor, stream=stream)
+# output_tensor contains the sum; input_tensor is unchanged.
+```
+
+The public `mcr_dl.all_reduce_out(output_tensor, input_tensor, op=ReduceOp.SUM,
+group=None, async_op=False)` API supports MPI, NCCL, and the PyTorch backend.
+Input and output must be dense, contiguous, nonoverlapping tensors with equal
+element counts, dtype, and device. Native MPI and NCCL bindings also accept the
+overload `all_reduce(output, input, ...)`, using the same implementation as
+in-place `all_reduce(tensor, ...)`. The PyTorch backend copies input into output
+before calling its existing in-place reduction. Completion and return behavior
+match each backend's `all_reduce`.
+
 ### CUDA stream
 
 The native MPI tensor API accepts `stream=`, a `torch.cuda.Stream` on the tensor's device. Omitting it uses the current stream on that device. MCR-DL records a reusable CUDA event on the selected stream, waits for it on the CPU, and then calls MPI.
@@ -97,6 +115,13 @@ srun -N1 -n4 python all_reduce.py --scan --dist mcr_dl --backend mpi --dtype bfl
 Use `--help` to find more commands.
 
 Like the individual benchmarks, `run_all.py` supports scanning arguments for the max message size, bw-unit, etc. Simply pass the desired arguments to `run_all.py` and they'll be propagated to each comm op.
+
+All-reduce benchmarks use a separate output tensor by default. Add `--in-place`
+to `all_reduce.py`, `run_all.py`, or `compare_torch.py` to benchmark in-place
+all-reduce. The selected mode appears in the output. With `--dist torch`,
+out-of-place timing includes copying the input into the preallocated output
+before calling `torch.distributed.all_reduce`; MCR-DL calls `all_reduce_out`
+directly. The comparison runner uses the same torch baseline.
 
 
 # Adding Communication Benchmarks

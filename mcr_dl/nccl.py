@@ -119,6 +119,10 @@ class NCCLBackend(Backend):
                    block=False):
         self.nccl_comm_op.all_reduce(tensor, op, block, group, async_op)
 
+    def all_reduce_out(self, output_tensor, input_tensor, op=ReduceOp.SUM,
+                       group=None, async_op=False, block=False):
+        self.nccl_comm_op.all_reduce_out(output_tensor, input_tensor, op, block, group, async_op)
+
     def reduce(self,
                tensor,
                dst,

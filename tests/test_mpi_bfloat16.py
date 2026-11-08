@@ -61,8 +61,8 @@ def test_bfloat16_all_reduce(mpi_backend, device, numel):
     tensor = (pattern * (rank + 1)).to(device=device, dtype=torch.bfloat16)
     expected = (pattern * (size * (size + 1) // 2)).to(torch.bfloat16)
 
-    # The current MCR-DL MPI wrapper does not order CUDA producer work.
-    # Make inputs ready explicitly so this test isolates datatype support.
+    # Make inputs ready explicitly to isolate datatype support; NativeGroup also
+    # synchronizes CUDA producer work before entering MPI.
     if tensor.is_cuda:
         torch.cuda.synchronize()
     mpi_backend.all_reduce(tensor)
