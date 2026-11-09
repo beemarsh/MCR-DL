@@ -25,6 +25,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
+#include <torch/library.h>
 #include <chrono>
 namespace py = pybind11;
 
@@ -264,6 +265,16 @@ namespace mpi
         }
     };
 
+    class NativeGroup;
+
+    // Groups by id, for the C++ PyTorch ops below, which take an int group id
+    // instead of a Python object. Entries are cleared when a group is destroyed.
+    inline std::vector<NativeGroup *> &group_registry()
+    {
+        static std::vector<NativeGroup *> groups;
+        return groups;
+    }
+
     // One communicator for a set of existing MPI ranks. Tensor operations use
     // this group; it does not create processes or worker threads.
     class NativeGroup
@@ -271,6 +282,16 @@ namespace mpi
     public:
         NativeGroup(const NativeGroup &) = delete;
         NativeGroup &operator=(const NativeGroup &) = delete;
+
+        ~NativeGroup()
+        {
+            auto &groups = group_registry();
+            if (id_ >= 0 && id_ < static_cast<int>(groups.size()))
+                groups[id_] = nullptr;
+        }
+
+        // Id accepted by the mcr_dl::all_reduce_inplace / all_reduce_out PyTorch ops.
+        int id() const { return id_; }
 
         explicit NativeGroup(std::vector<int> ranks)
         {
@@ -293,6 +314,8 @@ namespace mpi
             MPICHECK(MPI_Group_free(&world_group));
             MPICHECK(MPI_Comm_rank(comm_, &rank_));
             MPICHECK(MPI_Comm_size(comm_, &size_));
+            id_ = static_cast<int>(group_registry().size());
+            group_registry().push_back(this);
         }
 
         // MPI_Finalize owns communicator cleanup. Python object destruction is not
@@ -475,6 +498,7 @@ namespace mpi
         using Clock = std::chrono::steady_clock;
         MPI_Comm comm_;
         int rank_, size_;
+        int id_ = -1;
         // Created on first use; PyTorch's event wrapper handles device-aware cleanup.
         std::map<int, at::cuda::CUDAEvent> ready_events_;
 
@@ -622,6 +646,8 @@ namespace mpi
             "otherwise pass (CUDA stream handle, device index). Order all buffer accesses before this stream. "
             "Blocking operations return with MPI buffer access complete; CUDA graph capture is unsupported.")
             .def(py::init<std::vector<int>>(), py::call_guard<py::gil_scoped_release>())
+            .def("id", &NativeGroup::id,
+                 "Group id for torch.ops.mcr_dl.all_reduce_inplace and torch.ops.mcr_dl.all_reduce_out.")
             .def("rank", &NativeGroup::rank)
             .def("size", &NativeGroup::size)
             .def("all_reduce", py::overload_cast<torch::Tensor, int, bool, Stream>(&NativeGroup::all_reduce),
@@ -706,4 +732,74 @@ namespace mpi
               py::call_guard<py::gil_scoped_release>());
     }
 
+    // ---- PyTorch operators -------------------------------------------------
+    // torch.ops.mcr_dl.all_reduce_inplace / all_reduce_out reach MPI through the
+    // dispatcher alone: no Python implementation and no pybind argument parsing
+    // per call. They use the tensor device's current CUDA stream, like the
+    // NativeGroup methods called with stream=None.
+
+    NativeGroup &lookup_group(int64_t id)
+    {
+        auto &groups = group_registry();
+        TORCH_CHECK(id >= 0 && id < static_cast<int64_t>(groups.size()) && groups[id] != nullptr,
+                    "MCR-DL: no NativeGroup with id ", id);
+        return *groups[id];
+    }
+
+    // Release the GIL while MPI blocks, as the pybind bindings do, so other
+    // Python threads keep running. Callers without the GIL run unchanged.
+    template <typename F>
+    void without_gil(F &&fn)
+    {
+        if (Py_IsInitialized() && PyGILState_Check())
+        {
+            py::gil_scoped_release release;
+            fn();
+        }
+        else
+        {
+            fn();
+        }
+    }
+
+    void all_reduce_inplace_op(at::Tensor &tensor, int64_t group, int64_t op)
+    {
+        NativeGroup &g = lookup_group(group);
+        without_gil([&] { g.all_reduce(tensor, static_cast<int>(op)); });
+    }
+
+    void all_reduce_out_op(const at::Tensor &input, at::Tensor &output, int64_t group, int64_t op)
+    {
+        NativeGroup &g = lookup_group(group);
+        without_gil([&] { g.all_reduce(output, input, static_cast<int>(op)); });
+    }
+
+    // Shape-only kernels for torch.compile tracing: the ops only mutate.
+    void all_reduce_inplace_meta(at::Tensor &, int64_t, int64_t) {}
+    void all_reduce_out_meta(const at::Tensor &, at::Tensor &, int64_t, int64_t) {}
+
 } // namespace mpi
+
+TORCH_LIBRARY(mcr_dl, m)
+{
+    m.def("all_reduce_inplace(Tensor(a!) tensor, int group, int op=0) -> ()");
+    m.def("all_reduce_out(Tensor input, Tensor(a!) output, int group, int op=0) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(mcr_dl, CUDA, m)
+{
+    m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_op);
+    m.impl("all_reduce_out", &mpi::all_reduce_out_op);
+}
+
+TORCH_LIBRARY_IMPL(mcr_dl, CPU, m)
+{
+    m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_op);
+    m.impl("all_reduce_out", &mpi::all_reduce_out_op);
+}
+
+TORCH_LIBRARY_IMPL(mcr_dl, Meta, m)
+{
+    m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_meta);
+    m.impl("all_reduce_out", &mpi::all_reduce_out_meta);
+}
