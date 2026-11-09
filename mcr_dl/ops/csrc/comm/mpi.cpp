@@ -48,6 +48,7 @@ namespace py = pybind11;
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -326,14 +327,47 @@ namespace mpi
         }
     };
 
+    // One thread: make prior writes visible system-wide, ring the doorbell with
+    // the slot id, spin until the proxy writes the same id to "done", reset it.
+    // Both words are pinned host memory mapped into the device address space.
+    // Loaded with cuModuleLoadData, so building MCR-DL needs no nvcc.
+    constexpr const char *kSignalWaitPtx = R"PTX(
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry mcr_dl_proxy_signal_wait(
+    .param .u64 doorbell,
+    .param .u64 done,
+    .param .u32 id
+)
+{
+    .reg .u64 %rd<3>;
+    .reg .u32 %r<3>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [doorbell];
+    ld.param.u64 %rd2, [done];
+    ld.param.u32 %r1, [id];
+    fence.sc.sys;
+    st.release.sys.global.u32 [%rd1], %r1;
+WAIT:
+    ld.acquire.sys.global.u32 %r2, [%rd2];
+    setp.ne.u32 %p1, %r2, %r1;
+    @%p1 bra WAIT;
+    st.relaxed.sys.global.u32 [%rd2], 0;
+    ret;
+}
+)PTX";
+
     // Runs the MPI all-reduces recorded in CUDA graphs, so a graph can contain
-    // blocking MPI. At each recorded all-reduce the graph, using CUDA stream
-    // memory operations, writes the call's slot id to a pinned host doorbell,
-    // waits until a pinned host "done" word holds the same id, and resets it.
+    // blocking MPI. At each recorded all-reduce the graph runs a one-thread
+    // kernel (kSignalWaitPtx) that writes the call's slot id to a pinned host
+    // doorbell, waits until a pinned host "done" word holds the same id, and
+    // resets it.
     // This thread polls the doorbell, runs MPI on the slot's buffers, which keep
     // their CUDA graph pool addresses on every replay, and then writes "done".
-    // The doorbell write carries a memory fence, so the buffers are ready for
-    // MPI when it lands. One proxy per device, never destroyed: its thread stops
+    // The kernel runs after the producing kernels and fences before the
+    // doorbell, so the buffers are ready for MPI when it lands. One proxy per device, never destroyed: its thread stops
     // in finalize().
     class GraphProxy
     {
@@ -383,13 +417,31 @@ namespace mpi
             return static_cast<uint32_t>(slots_.size());
         }
 
+        // Steady-clock ns when each request was seen and when its MPI call
+        // returned, for benchmarks; clears the record.
+        std::pair<std::vector<int64_t>, std::vector<int64_t>> take_times()
+        {
+            std::lock_guard<std::mutex> guard(times_mutex_);
+            auto times = std::make_pair(std::move(seen_ns_), std::move(done_ns_));
+            seen_ns_.clear();
+            done_ns_.clear();
+            return times;
+        }
+
         // Records the all-reduce with this slot id on a (capturing) stream.
         void enqueue(cudaStream_t stream, uint32_t id)
         {
             CUstream s = reinterpret_cast<CUstream>(stream);
-            CUCHECK(cuStreamWriteValue32(s, doorbell_, id, CU_STREAM_WRITE_VALUE_DEFAULT));
-            CUCHECK(cuStreamWaitValue32(s, done_, id, CU_STREAM_WAIT_VALUE_EQ));
-            CUCHECK(cuStreamWriteValue32(s, done_, 0, CU_STREAM_WRITE_VALUE_DEFAULT));
+            if (use_memops_)
+            {
+                CUCHECK(cuStreamWriteValue32(s, doorbell_, id, CU_STREAM_WRITE_VALUE_DEFAULT));
+                CUCHECK(cuStreamWaitValue32(s, done_, id, CU_STREAM_WAIT_VALUE_EQ));
+                CUCHECK(cuStreamWriteValue32(s, done_, 0, CU_STREAM_WRITE_VALUE_DEFAULT));
+                return;
+            }
+            CUdeviceptr doorbell = doorbell_, done = done_;
+            void *args[] = {&doorbell, &done, &id};
+            CUCHECK(cuLaunchKernel(signal_wait_, 1, 1, 1, 1, 1, 1, 0, s, args, nullptr));
         }
 
     private:
@@ -407,6 +459,15 @@ namespace mpi
             CUDACHECK(cudaHostGetDevicePointer(&dev, host, 0));
             doorbell_ = reinterpret_cast<CUdeviceptr>(dev);
             done_ = doorbell_ + kDoneWord * sizeof(uint32_t);
+            // The signal kernel by default; MCR_DL_GRAPH_PROXY_SIGNAL=memop uses
+            // three stream memory operations instead (slower GPU-side wait).
+            const char *signal = std::getenv("MCR_DL_GRAPH_PROXY_SIGNAL");
+            use_memops_ = signal != nullptr && std::string(signal) == "memop";
+            if (!use_memops_)
+            {
+                CUCHECK(cuModuleLoadData(&module_, kSignalWaitPtx));
+                CUCHECK(cuModuleGetFunction(&signal_wait_, module_, "mcr_dl_proxy_signal_wait"));
+            }
             // Set before the thread exists: from here on MPI calls are locked.
             graph_proxy_active().store(true, std::memory_order_release);
             thread_ = std::thread([this] { run(); });
@@ -457,6 +518,7 @@ namespace mpi
                 }
                 // The graph posts its next request only after this one's "done".
                 __atomic_store_n(&words_[0], 0u, __ATOMIC_RELAXED);
+                const int64_t seen = now_ns();
                 Slot slot;
                 {
                     std::lock_guard<std::mutex> guard(slots_mutex_);
@@ -470,11 +532,34 @@ namespace mpi
                 MPICHECK(MPI_Allreduce(slot.send, slot.recv, slot.count, slot.type,
                                        slot.op, slot.comm));
                 __atomic_store_n(&words_[kDoneWord], id, __ATOMIC_RELEASE);
+                record(seen, now_ns());
                 last_work = Clock::now();
             }
         }
 
+        static int64_t now_ns()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       Clock::now().time_since_epoch())
+                .count();
+        }
+
+        void record(int64_t seen, int64_t done)
+        {
+            std::lock_guard<std::mutex> guard(times_mutex_);
+            if (seen_ns_.size() < (1u << 20))
+            {
+                seen_ns_.push_back(seen);
+                done_ns_.push_back(done);
+            }
+        }
+
         const int device_;
+        bool use_memops_ = false;
+        CUmodule module_ = nullptr;
+        CUfunction signal_wait_ = nullptr;
+        std::mutex times_mutex_;
+        std::vector<int64_t> seen_ns_, done_ns_;
         uint32_t *words_ = nullptr;
         CUdeviceptr doorbell_ = 0, done_ = 0;
         std::mutex slots_mutex_;
@@ -1003,6 +1088,12 @@ namespace mpi
         m.def("abort", &abort_world, py::call_guard<py::gil_scoped_release>());
         m.def("initialize", &initialize, "mpi initialize", py::call_guard<py::gil_scoped_release>());
         m.def("finalize", &finalize, "mpi finalize", py::call_guard<py::gil_scoped_release>());
+        m.def("graph_proxy_take_times", [](int device) {
+                  GraphProxy *proxy = GraphProxy::find(device);
+                  return proxy ? proxy->take_times()
+                               : std::make_pair(std::vector<int64_t>{}, std::vector<int64_t>{});
+              },
+              "Benchmarks: (seen_ns, mpi_done_ns) per graph-proxy request since the last call.");
         m.def("get_rank", &get_rank, py::arg("group") = 0,
               py::call_guard<py::gil_scoped_release>());
         m.def("barrier", &barrier, py::call_guard<py::gil_scoped_release>());
