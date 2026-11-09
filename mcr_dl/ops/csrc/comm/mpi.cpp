@@ -17,6 +17,7 @@
 * limitations under the License.
 */
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <mpi.h>
 #if defined(OPEN_MPI) && OPEN_MPI
@@ -31,26 +32,37 @@ namespace py = pybind11;
 
 #include <ATen/cuda/CUDAEvent.h>
 #include <c10/core/DeviceGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <stdio.h>
 
+// Every MPI call takes mpi::MpiCallLock (see GraphProxy).
 #define MPICHECK(cmd)                                                        \
     do                                                                       \
     {                                                                        \
-        int e = cmd;                                                         \
+        int e;                                                               \
+        {                                                                    \
+            mpi::MpiCallLock mpi_call_lock_;                                 \
+            e = cmd;                                                         \
+        }                                                                    \
         if (e != MPI_SUCCESS)                                                \
         {                                                                    \
             printf("Failed: MPI error %s:%d '%d'\n", __FILE__, __LINE__, e); \
@@ -69,8 +81,53 @@ namespace py = pybind11;
         }                                                                                         \
     } while (0)
 
+#define CUCHECK(cmd)                                                                   \
+    do                                                                                 \
+    {                                                                                  \
+        CUresult r = cmd;                                                              \
+        if (r != CUDA_SUCCESS)                                                         \
+        {                                                                              \
+            const char *msg = nullptr;                                                 \
+            cuGetErrorString(r, &msg);                                                 \
+            TORCH_CHECK(false, "MCR-DL CUDA driver error ", msg ? msg : "", " in ", #cmd); \
+        }                                                                              \
+    } while (0)
+
 namespace mpi
 {
+
+    // Set while a GraphProxy thread runs. MPI is then called from two threads
+    // (MPI_THREAD_SERIALIZED), so every MPI call holds mpi_mutex().
+    inline std::atomic<bool> &graph_proxy_active()
+    {
+        static std::atomic<bool> active{false};
+        return active;
+    }
+
+    inline std::mutex &mpi_mutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    struct MpiCallLock
+    {
+        std::unique_lock<std::mutex> lock;
+        MpiCallLock()
+        {
+            if (graph_proxy_active().load(std::memory_order_acquire))
+                lock = std::unique_lock<std::mutex>(mpi_mutex());
+        }
+    };
+
+    // With a GraphProxy running, wait for the device before a caller's MPI
+    // call: a replayed graph may still need the proxy for its all-reduces, and
+    // a caller blocked in MPI would hold mpi_mutex() while peers wait on them.
+    inline void sync_device_for_proxy()
+    {
+        if (graph_proxy_active().load(std::memory_order_acquire))
+            CUDACHECK(cudaDeviceSynchronize());
+    }
 
     // The caller serializes whole MCR-DL operations (including event waits),
     // requests, and other MPI calls in this process.
@@ -96,6 +153,7 @@ namespace mpi
 
     void barrier()
     {
+        sync_device_for_proxy();
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
 
@@ -120,8 +178,11 @@ namespace mpi
                     "MCR-DL requires MPI_THREAD_SERIALIZED or MPI_THREAD_MULTIPLE");
     }
 
+    void stop_graph_proxies();
+
     void finalize()
     {
+        stop_graph_proxies();
         int finalized;
         MPICHECK(MPI_Finalized(&finalized));
         if (owns_mpi && !finalized)
@@ -265,6 +326,165 @@ namespace mpi
         }
     };
 
+    // Runs the MPI all-reduces recorded in CUDA graphs, so a graph can contain
+    // blocking MPI. At each recorded all-reduce the graph, using CUDA stream
+    // memory operations, writes the call's slot id to a pinned host doorbell,
+    // waits until a pinned host "done" word holds the same id, and resets it.
+    // This thread polls the doorbell, runs MPI on the slot's buffers, which keep
+    // their CUDA graph pool addresses on every replay, and then writes "done".
+    // The doorbell write carries a memory fence, so the buffers are ready for
+    // MPI when it lands. One proxy per device, never destroyed: its thread stops
+    // in finalize().
+    class GraphProxy
+    {
+    public:
+        struct Slot
+        {
+            MPI_Comm comm;
+            const void *send; // MPI_IN_PLACE for in-place all-reduces
+            void *recv;
+            int count;
+            MPI_Datatype type;
+            MPI_Op op;
+        };
+
+        // Starts the proxy; call outside CUDA graph capture.
+        static GraphProxy &get(int device)
+        {
+            std::lock_guard<std::mutex> guard(registry_mutex());
+            auto &proxy = registry()[device];
+            if (proxy == nullptr)
+                proxy = new GraphProxy(device);
+            return *proxy;
+        }
+
+        static GraphProxy *find(int device)
+        {
+            std::lock_guard<std::mutex> guard(registry_mutex());
+            auto it = registry().find(device);
+            return it == registry().end() ? nullptr : it->second;
+        }
+
+        static void stop_all()
+        {
+            std::lock_guard<std::mutex> guard(registry_mutex());
+            for (auto &entry : registry())
+                entry.second->stop();
+            graph_proxy_active().store(false, std::memory_order_release);
+        }
+
+        // Ids start at 1; 0 means an empty doorbell.
+        uint32_t add(const Slot &slot)
+        {
+            std::lock_guard<std::mutex> guard(slots_mutex_);
+            TORCH_CHECK(slots_.size() < std::numeric_limits<uint32_t>::max() - 1,
+                        "MCR-DL graph proxy slot ids exhausted");
+            slots_.push_back(slot);
+            return static_cast<uint32_t>(slots_.size());
+        }
+
+        // Records the all-reduce with this slot id on a (capturing) stream.
+        void enqueue(cudaStream_t stream, uint32_t id)
+        {
+            CUstream s = reinterpret_cast<CUstream>(stream);
+            CUCHECK(cuStreamWriteValue32(s, doorbell_, id, CU_STREAM_WRITE_VALUE_DEFAULT));
+            CUCHECK(cuStreamWaitValue32(s, done_, id, CU_STREAM_WAIT_VALUE_EQ));
+            CUCHECK(cuStreamWriteValue32(s, done_, 0, CU_STREAM_WRITE_VALUE_DEFAULT));
+        }
+
+    private:
+        using Clock = std::chrono::steady_clock;
+        static constexpr int kDoneWord = 32; // 128 bytes after the doorbell
+
+        explicit GraphProxy(int device) : device_(device)
+        {
+            c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device));
+            void *host = nullptr;
+            CUDACHECK(cudaHostAlloc(&host, 4096, cudaHostAllocMapped | cudaHostAllocPortable));
+            std::memset(host, 0, 4096);
+            words_ = static_cast<uint32_t *>(host);
+            void *dev = nullptr;
+            CUDACHECK(cudaHostGetDevicePointer(&dev, host, 0));
+            doorbell_ = reinterpret_cast<CUdeviceptr>(dev);
+            done_ = doorbell_ + kDoneWord * sizeof(uint32_t);
+            // Set before the thread exists: from here on MPI calls are locked.
+            graph_proxy_active().store(true, std::memory_order_release);
+            thread_ = std::thread([this] { run(); });
+            // The thread's CUDA setup must not overlap a later graph capture.
+            while (!ready_.load(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+
+        static std::map<int, GraphProxy *> &registry()
+        {
+            static std::map<int, GraphProxy *> proxies;
+            return proxies;
+        }
+
+        static std::mutex &registry_mutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        void stop()
+        {
+            stop_.store(true, std::memory_order_relaxed);
+            if (thread_.joinable())
+                thread_.join();
+        }
+
+        void run()
+        {
+            CUDACHECK(cudaSetDevice(device_));
+            ready_.store(true, std::memory_order_release);
+            auto last_work = Clock::now();
+            unsigned spins = 0;
+            while (!stop_.load(std::memory_order_relaxed))
+            {
+                const uint32_t id = __atomic_load_n(&words_[0], __ATOMIC_ACQUIRE);
+                if (id == 0)
+                {
+                    // Spin while decode steps run back to back; after 20 ms
+                    // without work, poll every 50 us instead.
+                    if (++spins % 4096 == 0 &&
+                        Clock::now() - last_work > std::chrono::milliseconds(20))
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+#if defined(__x86_64__)
+                    __builtin_ia32_pause();
+#endif
+                    continue;
+                }
+                // The graph posts its next request only after this one's "done".
+                __atomic_store_n(&words_[0], 0u, __ATOMIC_RELAXED);
+                Slot slot;
+                {
+                    std::lock_guard<std::mutex> guard(slots_mutex_);
+                    if (id > slots_.size())
+                    {
+                        fprintf(stderr, "MCR-DL graph proxy: unknown slot %u\n", id);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                    slot = slots_[id - 1];
+                }
+                MPICHECK(MPI_Allreduce(slot.send, slot.recv, slot.count, slot.type,
+                                       slot.op, slot.comm));
+                __atomic_store_n(&words_[kDoneWord], id, __ATOMIC_RELEASE);
+                last_work = Clock::now();
+            }
+        }
+
+        const int device_;
+        uint32_t *words_ = nullptr;
+        CUdeviceptr doorbell_ = 0, done_ = 0;
+        std::mutex slots_mutex_;
+        std::deque<Slot> slots_;
+        std::atomic<bool> stop_{false}, ready_{false};
+        std::thread thread_;
+    };
+
+    void stop_graph_proxies() { GraphProxy::stop_all(); }
+
     class NativeGroup;
 
     // Groups by id, for the C++ PyTorch ops below, which take an int group id
@@ -335,6 +555,56 @@ namespace mpi
             TORCH_CHECK(output.numel() == input.numel(),
                         "MCR-DL all_reduce requires equally sized input and output tensors");
             all_reduce_impl(output, input, op, is_prof, stream);
+        }
+
+        // All-reduce that can be recorded in a CUDA graph on the current stream
+        // (output may be input for MPI_IN_PLACE). During capture it records a
+        // GraphProxy all-reduce: both buffers must keep their addresses for as
+        // long as the graph is replayed, as CUDA graph pool memory does.
+        // Otherwise it starts this device's GraphProxy and runs the blocking
+        // all-reduce, so call it once before capturing.
+        void all_reduce_graph(const torch::Tensor &output, const torch::Tensor &input, int op)
+        {
+            const bool in_place = output.is_same(input);
+            if (in_place)
+            {
+                TORCH_CHECK(input.defined() && input.is_contiguous() && !input.is_sparse() &&
+                                (input.is_cpu() || input.is_cuda()),
+                            "MCR-DL MPI requires a dense contiguous CPU or CUDA tensor");
+            }
+            else
+            {
+                check_buffers(output, input);
+                TORCH_CHECK(output.numel() == input.numel(),
+                            "MCR-DL all_reduce_graph requires equally sized input and output tensors");
+            }
+            if (input.is_cpu())
+            {
+                all_reduce_impl(output, input, op, false, std::nullopt);
+                return;
+            }
+            const int device = input.get_device();
+            c10::cuda::CUDAGuard guard(input.device());
+            const auto stream = c10::cuda::getCurrentCUDAStream(device);
+            cudaStreamCaptureStatus status;
+            CUDACHECK(cudaStreamIsCapturing(stream.stream(), &status));
+            if (status == cudaStreamCaptureStatusNone)
+            {
+                GraphProxy::get(device);
+                all_reduce_impl(output, input, op, false, std::nullopt);
+                return;
+            }
+            TORCH_CHECK(status == cudaStreamCaptureStatusActive,
+                        "MCR-DL all_reduce_graph: the CUDA graph capture was invalidated");
+            GraphProxy *proxy = GraphProxy::find(device);
+            TORCH_CHECK(proxy != nullptr,
+                        "MCR-DL all_reduce_graph must run once outside CUDA graph capture "
+                        "(this starts the graph proxy) before it is captured");
+            const uint32_t id = proxy->add({comm_, in_place ? MPI_IN_PLACE : input.data_ptr(),
+                                            output.data_ptr(), count(input),
+                                            get_mpi_datatype(input.scalar_type()),
+                                            reduction_op(op)});
+            proxy->enqueue(stream.stream(), id);
         }
 
         void all_gather(torch::Tensor output, torch::Tensor input, Stream stream = std::nullopt)
@@ -491,6 +761,7 @@ namespace mpi
 
         void barrier()
         {
+            sync_device_for_proxy();
             MPICHECK(MPI_Barrier(comm_));
         }
 
@@ -607,6 +878,7 @@ namespace mpi
             if (tensor.is_cpu())
             {
                 TORCH_CHECK(!stream, "CPU tensors do not accept a CUDA stream");
+                sync_device_for_proxy();
                 return;
             }
             TORCH_CHECK(!stream || stream->second == tensor.get_device(),
@@ -620,6 +892,12 @@ namespace mpi
             CUDACHECK(cudaStreamIsCapturing(cuda_stream.stream(), &status));
             TORCH_CHECK(status == cudaStreamCaptureStatusNone,
                         "MCR-DL MPI operations cannot execute inside CUDA graph capture");
+            if (graph_proxy_active().load(std::memory_order_acquire))
+            {
+                // Also covers this stream (see sync_device_for_proxy).
+                CUDACHECK(cudaDeviceSynchronize());
+                return;
+            }
             // The caller orders all buffer accesses before this event. Wait for
             // that stream's work before MPI touches the buffers, not the whole GPU.
             auto &ready = ready_events_[tensor.get_device()]; // Timing disabled by default.
@@ -774,9 +1052,29 @@ namespace mpi
         without_gil([&] { g.all_reduce(output, input, static_cast<int>(op)); });
     }
 
+    at::Tensor all_reduce_graph_op(const at::Tensor &input, int64_t group, int64_t op)
+    {
+        NativeGroup &g = lookup_group(group);
+        at::Tensor output = at::empty_like(input, at::MemoryFormat::Contiguous);
+        without_gil([&] { g.all_reduce_graph(output, input, static_cast<int>(op)); });
+        return output;
+    }
+
+    void all_reduce_graph_inplace_op(at::Tensor &tensor, int64_t group, int64_t op)
+    {
+        NativeGroup &g = lookup_group(group);
+        without_gil([&] { g.all_reduce_graph(tensor, tensor, static_cast<int>(op)); });
+    }
+
+    at::Tensor all_reduce_graph_meta(const at::Tensor &input, int64_t, int64_t)
+    {
+        return at::empty_like(input, at::MemoryFormat::Contiguous);
+    }
+
     // Shape-only kernels for torch.compile tracing: the ops only mutate.
     void all_reduce_inplace_meta(at::Tensor &, int64_t, int64_t) {}
     void all_reduce_out_meta(const at::Tensor &, at::Tensor &, int64_t, int64_t) {}
+    void all_reduce_graph_inplace_meta(at::Tensor &, int64_t, int64_t) {}
 
 } // namespace mpi
 
@@ -784,22 +1082,31 @@ TORCH_LIBRARY(mcr_dl, m)
 {
     m.def("all_reduce_inplace(Tensor(a!) tensor, int group, int op=0) -> ()");
     m.def("all_reduce_out(Tensor input, Tensor(a!) output, int group, int op=0) -> ()");
+    // Recordable in CUDA graphs (see NativeGroup::all_reduce_graph).
+    m.def("all_reduce_graph(Tensor input, int group, int op=0) -> Tensor");
+    m.def("all_reduce_graph_inplace(Tensor(a!) tensor, int group, int op=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(mcr_dl, CUDA, m)
 {
     m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_op);
     m.impl("all_reduce_out", &mpi::all_reduce_out_op);
+    m.impl("all_reduce_graph", &mpi::all_reduce_graph_op);
+    m.impl("all_reduce_graph_inplace", &mpi::all_reduce_graph_inplace_op);
 }
 
 TORCH_LIBRARY_IMPL(mcr_dl, CPU, m)
 {
     m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_op);
     m.impl("all_reduce_out", &mpi::all_reduce_out_op);
+    m.impl("all_reduce_graph", &mpi::all_reduce_graph_op);
+    m.impl("all_reduce_graph_inplace", &mpi::all_reduce_graph_inplace_op);
 }
 
 TORCH_LIBRARY_IMPL(mcr_dl, Meta, m)
 {
     m.impl("all_reduce_inplace", &mpi::all_reduce_inplace_meta);
     m.impl("all_reduce_out", &mpi::all_reduce_out_meta);
+    m.impl("all_reduce_graph", &mpi::all_reduce_graph_meta);
+    m.impl("all_reduce_graph_inplace", &mpi::all_reduce_graph_inplace_meta);
 }
